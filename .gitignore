@@ -1,0 +1,32 @@
+# Logs
+log.txt
+log1.txt
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Large data files
+# Use git-lfs for large data files if you need to track them
+data/
+*.json
+*.jsonl
+
+# Output directories
+output/
+output1/
+
+# Model checkpoints and weights
+*.bin
+*.pt
+latest
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Temporary files
+all_files_contents.txt
+
+# DeepSpeed logs
+runs/

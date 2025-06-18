@@ -1,0 +1,55 @@
+model_args:
+  model_name_or_path: meta-llama/Meta-Llama-3.1-8B-Instruct
+  protein_encoder_name_or_path: esm3_sm_open_v1
+  mm_use_resampler_gca: True
+  mm_gated_cross_attention: True # Explicitly enable GCA
+  mm_projector_type: mlp2x_gelu
+  num_media_tokens: 128
+  mm_protein_select_layer: -2 # Feature from one of the later layers of ESM3
+  tune_mm_mlp_adapter: True
+  use_mm_proj: True
+  esm_hidden_size: 1536 # Example for some ESM models
+  dim_head: 64
+  ff_mult: 4
+  perceiver_depth: 6
+  lora_enable: False # Disable LoRA for pretraining
+  
+
+data_args:
+  data_path: /data/macaulay/Mutation2Text/data/mut_text_data.json
+  require_both_sequences: True
+  # DELTA_TOKEN: "<delta_P>" # Defined in code, but useful to note here
+  # IGNORE_INDEX: -100 # Standard for labels to ignore
+
+training_args:
+  output_dir: ./output/pretrain_gca
+  do_train: True
+  do_eval: False
+  # Checkpoint will be auto-detected
+  num_train_epochs: 1
+  per_device_train_batch_size: 32
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 1
+  evaluation_strategy: "steps"
+  eval_steps: 500
+  save_strategy: "steps"
+  save_steps: 1000
+  save_total_limit: 3
+  learning_rate: 2.0e-4 # Learning rate for the adapter parts
+  weight_decay: 0.
+  warmup_ratio: 0.03
+  lr_scheduler_type: "cosine"
+  logging_steps: 10
+  report_to: "tensorboard"
+  mode: "train"
+
+  # DeepSpeed and Precision
+  deepspeed: ./configs/zero2.json
+  bf16: True
+  tf32: True
+  gradient_checkpointing: True
+
+  # Other important args
+  dataloader_num_workers: 4
+  remove_unused_columns: False # Important for custom data processing
+  # seed: 42 # For reproducibility

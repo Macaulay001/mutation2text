@@ -1,0 +1,69 @@
+model_args:
+  model_name_or_path: meta-llama/Meta-Llama-3.1-8B-Instruct
+  # Path to the pretrained adapter weights (GCA, Resampler, Projector)
+  # This will be the output directory of the pretrain_gca.sh script
+  pretrained_adapter_path: ./output/pretrain_gca/ # Replace XXXX with actual checkpoint step
+  protein_encoder_name_or_path: esm3_sm_open_v1 # Reverted to ESM3 model
+  mm_use_resampler_gca: True
+  mm_gated_cross_attention: True
+  mm_projector_type: mlp2x_gelu
+  num_media_tokens: 128
+  mm_protein_select_layer: -2
+  use_mm_proj: True
+
+  # LoRA specific arguments
+  lora_enable: True
+  lora_r: 16 # LoRA rank
+  lora_alpha: 32 # LoRA alpha
+  lora_dropout: 0.05
+  # Specify which modules of the LLM to apply LoRA to.
+  # Common choices are query, key, value, and output layers in attention blocks, and sometimes MLP layers.
+  # This needs to match the Llama 3.1 architecture. Example:
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  # Set to True to make GCA, Resampler, Projector trainable alongside LoRA parameters
+  # Set to False if you want to freeze these modules and only train LoRA parameters
+  tune_mm_mlp_adapter: True # Adapters are trainable
+  # mode: train # Set to 'train' for finetuning, 'inference' for evaluation
+  esm_hidden_size: 1536 # Example for some ESM models
+  dim_head: 64
+  ff_mult: 4
+  perceiver_depth: 6
+  gca_output_dim: 512 # Adjusted for LoRA finetuning
+   # Set to 'finetune' for LoRA finetuning
+  
+
+data_args:
+  data_path: /data/macaulay/Mutation2Text/data/mut_text_data.json # Assumes a split for finetuning
+  # eval_data_path: /data/macaulay/Mutation2Text/data/finetune_eval_data.json # Assumes a split for finetuning
+  require_both_sequences: True
+
+training_args:
+  output_dir: ./output/finetune_lora
+  num_train_epochs: 5
+  per_device_train_batch_size: 32 # Can often be smaller for LoRA due to adapter memory
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 1
+  evaluation_strategy: "steps"
+  eval_steps: 200
+  save_strategy: "steps"
+  save_steps: 4000
+  save_total_limit: 2
+  learning_rate: 1.0e-5 # Smaller learning rate for LLM finetuning
+  weight_decay: 0.
+  warmup_ratio: 0.03
+  lr_scheduler_type: "cosine"
+  logging_steps: 10
+  report_to: "tensorboard"
+  do_train: True
+  mode: "train"
+
+  # DeepSpeed and Precision (can be same as pretraining or adjusted)
+  deepspeed: ./configs/zero2.json
+  bf16: True
+  tf32: True
+  gradient_checkpointing: True # Still useful
+
+  # Other
+  dataloader_num_workers: 4
+  remove_unused_columns: False
+  # seed: 42 
