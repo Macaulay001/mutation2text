@@ -30,3 +30,6 @@ all_files_contents.txt
 
 # DeepSpeed logs
 runs/
+
+# Utility Scripts
+scripts/push_to_github.sh
