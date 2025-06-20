@@ -3,7 +3,8 @@ import json
 import torch
 import dataclasses
 from transformers import Trainer
-from typing import Any
+from typing import Any, Dict, Optional, Tuple, List, Union
+from transformers.training_args import TrainingArguments
 from peft import PeftModel
 
 class TrainingArgsEncoder(json.JSONEncoder):
@@ -27,8 +28,15 @@ from accelerate.utils import wait_for_everyone
 # HF Trainer already has self.accelerator, so you don't need to import Accelerator again.
 
 class AdapterTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
+    """
+    A custom trainer to handle saving adapter weights and an overridden
+    prediction step for models with custom inputs.
+    """
+    def __init__(self, *args, model_args=None, **kwargs):
         super().__init__(*args, **kwargs)
+        if model_args is None:
+            raise ValueError("AdapterTrainer requires model_args to be passed.")
+        self.model_args = model_args
         # Validate trainable parameters on initialization
         self._validate_trainable_parameters()
         
@@ -67,41 +75,95 @@ class AdapterTrainer(Trainer):
         print(f"===============================================\n")
         
     def training_step(self, model, inputs):
-        """Override training_step to add gradient debugging if needed"""
-        try:
-            return super().training_step(model, inputs)
-        except RuntimeError as e:
-            if "does not require grad and does not have a grad_fn" in str(e):
-                print("\n\n===== GRADIENT ERROR DIAGNOSTICS =====")
-                # Analyze the model's parameters
-                no_grad_params = []
-                trainable_params = []
-                
-                for name, param in model.named_parameters():
-                    if param.requires_grad:
-                        trainable_params.append(name)
-                    else:
-                        no_grad_params.append(name)
-                
-                print(f"Total parameters: {len(trainable_params) + len(no_grad_params)}")
-                print(f"Trainable parameters: {len(trainable_params)}")
-                print(f"Non-trainable parameters: {len(no_grad_params)}")
-                
-                print("\nFirst few trainable parameters:")
-                for name in trainable_params[:5]:
-                    print(f"  - {name}")
-                    
-                print("\nThis error usually indicates a mismatch between trainable parameters and the computation graph.")
-                print("The model likely has disconnected components or tensors that don't require gradients.")
-                print("Please check that all modules involved in the forward pass have their parameters set correctly.")
-                print("===================================\n\n")
-            # Re-raise the exception
-            raise
+        """Override training_step to add a manual gradient check."""
+        model.train()
+        inputs = self._prepare_inputs(inputs)
 
-    def save_model(self, output_dir=None, **_):
-        output_dir = output_dir or self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+        
+        # Standard backward pass
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+        self.accelerator.backward(loss)
 
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        """Saves the full model state and also saves adapter weights separately."""
+        # First, save the full model using the parent class method.
+        # This saves the base model, tokenizer, config, etc. as part of a checkpoint.
+        super().save_model(output_dir, _internal_call)
+
+        # Determine the correct output directory for adapters
+        final_output_dir = output_dir if output_dir is not None else self.args.output_dir
+
+        # Now, save the adapter weights separately.
+        self._save_adapters_only(final_output_dir)
+
+    def prediction_step(
+        self,
+        model: torch.nn.Module,
+        inputs: Dict[str, Any],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Overrides the default prediction step to handle custom model inputs during generation.
+        """
+        # Separate the standard inputs from our custom ones.
+        # `generate` expects `input_ids` and `attention_mask` as positional args.
+        standard_inputs = {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+        }
+        
+        # Prepare the custom kwargs that our model's forward pass expects.
+        custom_kwargs = {
+            "wild_type_sequences": inputs.get("wild_type_sequences"),
+            "mutation_sequences": inputs.get("mutation_sequences"),
+        }
+
+        # Run the standard prediction step to get the loss.
+        loss, _, _ = super().prediction_step(model, inputs, prediction_loss_only=True, ignore_keys=ignore_keys)
+
+        # If we are only calculating loss, we are done.
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        # If predict_with_generate is enabled, run generation.
+        # We must manually pass our custom kwargs here.
+        generated_tokens = self.model.generate(
+            **standard_inputs,
+            **custom_kwargs,
+            max_new_tokens=128  # You can make this configurable
+        )
+        
+        # The rest of this logic is standard from the Trainer to handle labels.
+        labels = inputs.get("labels")
+        if labels is not None and len(labels.shape) > 1:
+             # Ensure generated tokens are padded to the same length as labels for metrics
+            if generated_tokens.shape[-1] < labels.shape[-1]:
+                generated_tokens = self._pad_tensors_to_max_len(generated_tokens, labels)
+        
+        return (loss, generated_tokens, labels)
+
+    def _pad_tensors_to_max_len(self, tensor, target_tensor):
+        """Pads a tensor to the length of a target tensor."""
+        # (Your existing _pad_tensors_to_max_len implementation if you have one,
+        # otherwise, a simple implementation is needed if it's called from prediction_step)
+        target_len = target_tensor.shape[-1]
+        current_len = tensor.shape[-1]
+        if target_len > current_len:
+            padding_size = target_len - current_len
+            return torch.nn.functional.pad(tensor, (0, padding_size))
+        return tensor
+
+    def _save_adapters_only(self, output_dir: str):
+        """
+        Saves only the trainable adapter parameters to a file named 'adapters_only.pt'.
+        This includes GCA, Resampler, Projector, and potentially LoRA layers if enabled.
+        """
         # 1️⃣  ALWAYS unwrap first
         peft_model = self.accelerator.unwrap_model(self.model)
 

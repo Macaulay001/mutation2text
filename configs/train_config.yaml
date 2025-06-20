@@ -18,6 +18,7 @@ model_args:
 data_args:
   data_path: /data/macaulay/Mutation2Text/data/mut_text_data.json
   require_both_sequences: True
+  max_text_len: 2048
   # DELTA_TOKEN: "<delta_P>" # Defined in code, but useful to note here
   # IGNORE_INDEX: -100 # Standard for labels to ignore
 
@@ -27,13 +28,13 @@ training_args:
   do_eval: False
   # Checkpoint will be auto-detected
   num_train_epochs: 1
-  per_device_train_batch_size: 32
+  per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 1
   evaluation_strategy: "steps"
   eval_steps: 500
   save_strategy: "steps"
-  save_steps: 1000
+  save_steps: 10000
   save_total_limit: 3
   learning_rate: 2.0e-4 # Learning rate for the adapter parts
   weight_decay: 0.
@@ -47,7 +48,7 @@ training_args:
   deepspeed: ./configs/zero2.json
   bf16: True
   tf32: True
-  gradient_checkpointing: True
+  gradient_checkpointing: False
 
   # Other important args
   dataloader_num_workers: 4

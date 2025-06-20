@@ -11,8 +11,10 @@ from transformers import (
     TrainingArguments,
     Trainer,
     set_seed,
+    EvalPrediction,
 )
 from adapter_trainer import AdapterTrainer
+import numpy as np
 # Add project root to sys.path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
@@ -76,6 +78,7 @@ class CustomTrainingArguments(TrainingArguments):
     logging_steps: int = field(default=10)
     report_to: str = field(default="tensorboard")
     do_train: bool = field(default=True)
+    predict_with_generate: bool = field(default=False)
     mode: str = field(default="train")
     
 
@@ -183,6 +186,29 @@ def main():
 
     model, tokenizer = load_model_and_tokenizer(model_args, training_args)
 
+    # Define the compute_metrics function to see decoded predictions
+    def compute_metrics(eval_pred: EvalPrediction):
+        predictions = eval_pred.predictions
+        labels = eval_pred.label_ids
+
+        # Decode generated summaries, skipping special tokens
+        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        
+        # Replace -100 in the labels as we can't decode them.
+        labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        
+        # Print a few examples for quick verification
+        print("\n--- Evaluation Predictions ---")
+        for i in range(min(3, len(decoded_preds))): # Print up to 3 examples
+            print(f"Reference:  {decoded_labels[i]}")
+            print(f"Prediction: {decoded_preds[i]}")
+            print("-" * 20)
+        
+        # You can compute and return metrics like ROUGE here
+        # For now, we just want to see the output, so we return an empty dict.
+        return {}
+
     train_dataset = MutationTextDataset(
         data_path=data_args.data_path,
         tokenizer=tokenizer,
@@ -206,10 +232,12 @@ def main():
     trainer = AdapterTrainer(
         model=model,
         args=training_args,
+        model_args=model_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=custom_collate_fn,
+        compute_metrics=compute_metrics,
     )
 
     if training_args.do_train:
@@ -230,4 +258,6 @@ def main():
         print("Evaluation finished. Metrics saved.")
 
 if __name__ == "__main__":
+    # Set CUDA_VISIBLE_DEVICES to use both cuda:0 and cuda:2
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1,2"
     main()

@@ -2,7 +2,7 @@ model_args:
   model_name_or_path: meta-llama/Meta-Llama-3.1-8B-Instruct
   # Path to the pretrained adapter weights (GCA, Resampler, Projector)
   # This will be the output directory of the pretrain_gca.sh script
-  pretrained_adapter_path: ./output/pretrain_gca/ # Replace XXXX with actual checkpoint step
+  pretrained_adapter_path: ./output/pretrain_gca/checkpoint-10000/ # Replace XXXX with actual checkpoint step
   protein_encoder_name_or_path: esm3_sm_open_v1 # Reverted to ESM3 model
   mm_use_resampler_gca: True
   mm_gated_cross_attention: True
@@ -33,28 +33,31 @@ model_args:
   
 
 data_args:
-  data_path: /data/macaulay/Mutation2Text/data/mut_text_data.json # Assumes a split for finetuning
-  # eval_data_path: /data/macaulay/Mutation2Text/data/finetune_eval_data.json # Assumes a split for finetuning
-  require_both_sequences: True
+  data_path: ./data/finetune_train.jsonl
+  eval_data_path: ./data/finetune_val.jsonl
+  require_both_sequences: true
+  max_text_len: 2048
 
 training_args:
   output_dir: ./output/finetune_lora
-  num_train_epochs: 5
-  per_device_train_batch_size: 32 # Can often be smaller for LoRA due to adapter memory
+  do_train: true
+  do_eval: false
+  num_train_epochs: 3
+  per_device_train_batch_size: 8
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 1
   evaluation_strategy: "steps"
-  eval_steps: 200
+  eval_steps: 10
   save_strategy: "steps"
-  save_steps: 4000
+  save_steps: 10000
   save_total_limit: 2
-  learning_rate: 1.0e-5 # Smaller learning rate for LLM finetuning
+  learning_rate: 2.0e-5 # Smaller learning rate for LLM finetuning
   weight_decay: 0.
   warmup_ratio: 0.03
   lr_scheduler_type: "cosine"
-  logging_steps: 10
+  logging_steps: 100
   report_to: "tensorboard"
-  do_train: True
+  predict_with_generate: true
   mode: "train"
 
   # DeepSpeed and Precision (can be same as pretraining or adjusted)
