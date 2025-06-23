@@ -59,7 +59,7 @@ def load_model_and_tokenizer(model_args, training_args):
 
     # Instantiate and set the protein encoder
     print("[DEBUG] Configuring protein encoder.")
-    print(f"[DEBUG] mode detected: {getattr(training_args, 'mode', None)}")
+    print(f"[DEBUG] 2 mode detected: {getattr(training_args, 'mode', None)}")
     if getattr(training_args, 'mode', None) == 'inference':
         # For inference mode, try cuda:1 first, if not available fall back to cuda:0, then cpu
         if torch.cuda.is_available() and torch.cuda.device_count() > 1:
@@ -84,12 +84,7 @@ def load_model_and_tokenizer(model_args, training_args):
     config.protein_config["esm_hidden_size"] = esm_output_dim
 
     # Re-instantiate the model with the correct config
-    model = LlavaLlamaForCausalLM.from_pretrained(
-        model_args.model_name_or_path, 
-        config=config,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2"
-    )
+    model = LlavaLlamaForCausalLM.from_pretrained(model_args.model_name_or_path, config=config)
     model.resize_token_embeddings(len(tokenizer))
     model.set_delta_token_id(delta_token_id)
 
@@ -136,14 +131,11 @@ def load_model_and_tokenizer(model_args, training_args):
                 print(f"Successfully loaded adapter weights from {adapters_only_path}.")
 
             except Exception as e:
-                
                 print(f"Error loading adapter weights from {adapters_only_path}: {e}")
                 print("Proceeding with randomly initialized or default weights for adapters.")
-                pass
         else:
-            
-            print(f"Warning: No adapters_only.pt file found in {adapter_path_dir}, Adapter weights will not be loaded from this path.")
-            pass
+            print(f"Warning: No adapters_only.pt file found in {adapter_path_dir}. "
+                  "Adapter weights will not be loaded from this path.")
 
     # --- MODE HANDLING: skip training-only logic if in inference mode ---
     # Accepts model_args.mode ('train' or 'inference'), or model_args.is_inference (bool)
@@ -196,10 +188,8 @@ def load_model_and_tokenizer(model_args, training_args):
                     trainable_modules.append("GCA")
                 else:
                     print("WARNING: mm_gated_cross_attention exists but is None")
-                    pass
             else:
                 print("WARNING: mm_gated_cross_attention module not found in model")
-                pass
             
             # Resampler
             if hasattr(model, 'mm_resampler'):
@@ -210,10 +200,8 @@ def load_model_and_tokenizer(model_args, training_args):
                     trainable_modules.append("Resampler")
                 else:
                     print("WARNING: mm_resampler exists but is None")
-                    pass
             else:
                 print("WARNING: mm_resampler module not found in model")
-                pass
             
             # Projector
             if hasattr(model, 'mm_projector'):
@@ -224,10 +212,8 @@ def load_model_and_tokenizer(model_args, training_args):
                     trainable_modules.append("Projector")
                 else:
                     print("WARNING: mm_projector exists but is None")
-                    pass
             else:
                 print("WARNING: mm_projector module not found in model")
-                pass
 
             # Summary and validation
             print(f"\nConfiguration Summary:")
@@ -251,26 +237,94 @@ def load_model_and_tokenizer(model_args, training_args):
                 )
 
         if getattr(model_args, 'lora_enable', False):
-            print("[INFO] LoRA finetuning enabled. Applying LoRA to the model.")
+            print("LoRA finetuning mode: Configuring GCA, Resampler, Projector trainability based on tune_mm_mlp_adapter.")
             
-            lora_config_params = {
-                'r': model_args.lora_r,
-                'lora_alpha': model_args.lora_alpha,
-                'target_modules': model_args.lora_target_modules,
-                'lora_dropout': model_args.lora_dropout,
-                'bias': getattr(model_args, 'lora_bias', 'none'),
+            # Conditionally make multimodal modules (GCA, Resampler, Projector) trainable
+            # based on tune_mm_mlp_adapter flag
+            tune_adapters = getattr(model_args, 'tune_mm_mlp_adapter', False)
+            if tune_adapters:
+                print("Training adapters: tune_mm_mlp_adapter=True")
+                if hasattr(model, 'mm_gated_cross_attention') and model.mm_gated_cross_attention is not None:
+                    print("Setting GCA module (mm_gated_cross_attention) as trainable.")
+                    for param in model.mm_gated_cross_attention.parameters():
+                        param.requires_grad = True
+                if hasattr(model, 'mm_resampler') and model.mm_resampler is not None:
+                    print("Setting Protein Resampler module (mm_resampler) as trainable.")
+                    for param in model.mm_resampler.parameters():
+                        param.requires_grad = True
+            else:
+                print("Freezing adapters: tune_mm_mlp_adapter=False")
+                if hasattr(model, 'mm_gated_cross_attention') and model.mm_gated_cross_attention is not None:
+                    print("Freezing GCA module (mm_gated_cross_attention) for LoRA.")
+                    for param in model.mm_gated_cross_attention.parameters():
+                        param.requires_grad = False
+                if hasattr(model, 'mm_resampler') and model.mm_resampler is not None:
+                    print("Freezing Protein Resampler module (mm_resampler) for LoRA.")
+                    for param in model.mm_resampler.parameters():
+                        param.requires_grad = False
+            if hasattr(model, 'mm_projector') and model.mm_projector is not None:
+                if tune_adapters:
+                    print("Setting Multimodal Projector (mm_projector) as trainable.")
+                    for param in model.mm_projector.parameters():
+                        param.requires_grad = True
+                else:
+                    print("Freezing Multimodal Projector (mm_projector) for LoRA.")
+                    for param in model.mm_projector.parameters():
+                        param.requires_grad = False
+            
+            # LLM itself will be handled by PEFT; LoRA layers will be trainable.
+            print("Applying LoRA...")
+            lora_params = {
+                "r": model_args.lora_r,
+                "lora_alpha": model_args.lora_alpha,
+                "target_modules": model_args.lora_target_modules,
+                "lora_dropout": model_args.lora_dropout,
+                "bias": getattr(model_args, 'lora_bias', "none"),
             }
+            model = create_lora_model(model, lora_params) # This function should handle freezing non-LoRA LLM parts.
+            print("LoRA applied.")
+            print(f"Lora target modules: {model_args.lora_target_modules}")
 
-            # This single call now handles applying LoRA and unfreezing adapters if needed.
-            model = create_lora_model(
-                model, 
-                lora_config_params, 
-                tune_mm_adapters=getattr(model_args, 'tune_mm_mlp_adapter', False)
-            )
+            # Print trainable parameters
+            if hasattr(model, 'print_trainable_parameters'):
+                model.print_trainable_parameters()
+            
+            # Verify adapter modules are trainable if tune_mm_mlp_adapter=True
+            if tune_adapters:
+                print("\n[FINAL ADAPTER VERIFICATION]")
+                adapter_trainable = False
+                
+                # Check if GCA, Resampler and Projector parameters are still trainable
+                for name, param in model.named_parameters():
+                    if param.requires_grad and any(adapter in name for adapter in ['mm_gated_cross_attention', 'mm_resampler', 'mm_projector']):
+                        adapter_trainable = True
+                        print(f"Adapter parameter trainable: {name}")
+                
+                if not adapter_trainable:
+                    print("WARNING: No adapter parameters found to be trainable after LoRA application!")
+                    print("Setting adapter parameters as trainable again...")
+                    
+                    # Force adapter modules to be trainable
+                    if hasattr(model, 'base_model') and hasattr(model.base_model, 'model'):
+                        base = model.base_model.model
+                        if hasattr(base, 'mm_gated_cross_attention') and base.mm_gated_cross_attention is not None:
+                            for param in base.mm_gated_cross_attention.parameters():
+                                param.requires_grad = True
+                        if hasattr(base, 'mm_resampler') and base.mm_resampler is not None:
+                            for param in base.mm_resampler.parameters():
+                                param.requires_grad = True
+                        if hasattr(base, 'mm_projector') and base.mm_projector is not None:
+                            for param in base.mm_projector.parameters():
+                                param.requires_grad = True
+                    
+            # Count total trainable parameters
+            num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"Number of trainable parameters after LoRA: {num_trainable}")
+            if num_trainable == 0:
+                raise ValueError("No trainable parameters after applying LoRA. Check LoRA configuration and target modules.")
 
-    # print a summary of trainable parameters at the end for verification
-    print("\n--- Final Trainable Parameters Summary ---")
-    total_params = sum(p.numel() for p in model.parameters())
+        else:
+            print("Default mode: Trainable parameters determined by initial model state and previous freezing steps (e.g., protein encoder).")
 
     return model, tokenizer
 

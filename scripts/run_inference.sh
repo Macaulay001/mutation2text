@@ -30,7 +30,7 @@ export CUDA_VISIBLE_DEVICES="0"
 MODEL_TYPE=${1:-pretrain}  # Default to pretrain if not specified
 
 if [ "$MODEL_TYPE" = "pretrain" ]; then
-    CHECKPOINT_DIR="output/pretrain_gca/checkpoint-10000"  # Latest pretrained checkpoint
+    CHECKPOINT_DIR="output/pretrain_gca/checkpoint-2000"  # Latest pretrained checkpoint
     OUTPUT_PATH="output/generated_responses.jsonl"
     
     echo "Starting inference with pretrained model..."
@@ -49,11 +49,11 @@ if [ "$MODEL_TYPE" = "pretrain" ]; then
         --temperature $TEMPERATURE \
         --top_p $TOP_P \
         --mode inference \
-        --pretrained_adapter_path $CHECKPOINT_DIR \
+        --pretrained_adapter_path $FINETUNED_ADAPTER_PATH \
 
 
 elif [ "$MODEL_TYPE" = "finetune" ]; then
-    CHECKPOINT_DIR="output/finetune_lora/checkpoint-10000"  # Latest LoRA checkpoint directory
+    CHECKPOINT_DIR="/data/macaulay/second/scratch/mutation2text/output/finetune_lora"  # Latest LoRA checkpoint directory
     OUTPUT_PATH="output/generated_responses_finetuned.jsonl"
     
     # LoRA parameters
@@ -81,7 +81,7 @@ elif [ "$MODEL_TYPE" = "finetune" ]; then
         --lora_alpha $LORA_ALPHA \
         --lora_dropout $LORA_DROPOUT \
         --mode inference \
-        --pretrained_adapter_path $CHECKPOINT_DIR \
+        --pretrained_adapter_path $FINETUNED_ADAPTER_PATH \
 
 else
     echo "Invalid model type. Use 'pretrain' or 'finetune'"

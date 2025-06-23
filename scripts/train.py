@@ -49,7 +49,7 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default="/data/macaulay/second/scratch/mutation2text/data/mut_text_data.json")
     require_both_sequences: bool = field(default=True)
-    max_text_len: int = field(default=2048) # Max length for text tokenizer
+    max_text_len: int = field(default=512) # Max length for text tokenizer
 
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
@@ -225,7 +225,6 @@ def main():
     trainer = CustomRNGTrainer(
         model=model,
         args=training_args, # This now uses the fully resolved training_args
-        model_args=model_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
@@ -244,7 +243,7 @@ def main():
         t2 = time.time()
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
         print(f"[TIME] trainer.train() took {time.time() - t2:.2f} seconds.")
-        print("[DEBUG] trainer.train() finished. Result: {train_result}")
+        print(f"[DEBUG] trainer.train() finished. Result: {train_result}")
 
         t3 = time.time()
         print("[DEBUG] Attempting to save model (trainer.save_model())...")
@@ -293,6 +292,6 @@ def main():
         torch.distributed.destroy_process_group()
 
 if __name__ == "__main__":
-    # Set CUDA_VISIBLE_DEVICES to use both cuda:0 and cuda:2
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,2"
+    # Set CUDA_VISIBLE_DEVICES to use both cuda:0 and cuda:1
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
     main()

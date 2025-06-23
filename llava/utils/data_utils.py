@@ -117,46 +117,62 @@ class MutationTextDataset(Dataset):
         system_prompt = "You are a helpful assistant that explains protein mutations."
         human_query = self._sanitize_text(human_query)
         processed_query = human_query.replace("<wt_prot_seq> <mut_prot_seq>", DELTA_TOKEN)
+        # print(f"[DEBUG] Processed query for idx {idx}: {processed_query}")
+        text_input_for_tokenization = f"{system_prompt}\n\nHuman: {processed_query} \n\nAssistant:"
+        # text_input_for_tokenization = self._sanitize_text(human_query.replace("<wt_prot_seq>\n<mut_prot_seq>", DELTA_TOKEN))
         gpt_response = self._sanitize_text(gpt_response)
 
-        # Construct the full sequence for tokenization
-        prompt_part = f"{system_prompt}\\n\\nHuman: {processed_query} \\n\\nAssistant:"
-        full_text = prompt_part + " " + gpt_response + self.tokenizer.eos_token
-
-        # Tokenize the full text
-        tokenized_full = self.tokenizer(
-            full_text,
-            max_length=self.max_text_len,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        )
-        input_ids = tokenized_full.input_ids.squeeze(0)
-        attention_mask = tokenized_full.attention_mask.squeeze(0)
-
-        # Create labels, initially as a copy of input_ids
-        labels = input_ids.clone()
-
-        # Tokenize the prompt part separately to find its length for masking
-        prompt_tokens = self.tokenizer(
-            prompt_part,
-            max_length=self.max_text_len,
-            truncation=True,
-            add_special_tokens=False # Don't add BOS/EOS to the prompt part
-        ).input_ids
+        # print(f"[DEBUG] Tokenizing input: {text_input_for_tokenization}: gpt_response: {gpt_response}")
         
-        # Mask the prompt part in the labels
-        prompt_len = len(prompt_tokens)
-        labels[:prompt_len] = IGNORE_INDEX
-        
-        # Also mask padding in labels
-        labels[attention_mask == 0] = IGNORE_INDEX
+        try:
+            # Tokenize the prepared text input
+            tokenized_input = self.tokenizer(
+                text_input_for_tokenization,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_text_len,
+                return_tensors="pt"
+            )
+
+            # Tokenize gpt response for labels
+            tokenized_label = self.tokenizer(
+                gpt_response,
+                padding="max_length",
+                truncation=True,
+                max_length=self.max_text_len,
+                return_tensors="pt"
+            )
+
+        except Exception as e:
+            print(f"[ERROR] Tokenization failed for idx {idx}: {str(e)}")
+            # Return a default/empty item if tokenization fails
+            empty_tensor = torch.zeros((self.max_text_len,), dtype=torch.long)
+            return {
+                "input_ids": empty_tensor,
+                "attention_mask": empty_tensor,
+                "labels": empty_tensor.fill_(IGNORE_INDEX),
+                "id": record.get("id", f"index_{idx}"),
+                "wild_type_sequences": "",
+                "mutation_sequences": ""
+            }
+
+        input_ids = tokenized_input.input_ids.squeeze(0)
+        unique_tokens = torch.unique(input_ids)
+        # print(f"[DEBUG] Unique tokens in input for idx {idx}: {unique_tokens.tolist()}")
+
+
+        attention_mask = tokenized_input.attention_mask.squeeze(0)
+        labels = tokenized_label.input_ids.squeeze(0)
+
+        # Set labels to IGNORE_INDEX for padding tokens in the label sequence
+        labels[labels == self.tokenizer.pad_token_id] = IGNORE_INDEX
 
         item = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "id": record.get("id", f"index_{idx}"),
+            # Include protein sequences separately for the model's protein encoder
             "wild_type_sequences": wild_type_seq,
             "mutation_sequences": mutation_seq,
         }
@@ -166,14 +182,22 @@ class MutationTextDataset(Dataset):
         return item
 
 def custom_collate_fn(batch):
+    t0 = time.time()
     """
-    Custom collate function that stacks tensors for input_ids, attention_mask, and labels,
-    and collects protein sequences into lists.
-    Assumes all tensors in a batch have the same dimensions due to padding in __getitem__.
+    Custom collate function to handle batching of sequences and text.
+    Assumes that the model itself will handle the merging of protein and text embeddings.
+    This collate function primarily batches the text token IDs, attention masks, and labels,
+    and collects the protein sequences as lists.
     """
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    attention_mask = torch.stack([item['attention_mask'] for item in batch])
-    labels = torch.stack([item['labels'] for item in batch])
+    input_ids_list = [item['input_ids'] for item in batch]
+    attention_mask_list = [item['attention_mask'] for item in batch]
+    labels_list = [item['labels'] for item in batch]
+    
+    # Stack numerical tensors
+    # Padding has already been applied in __getitem__ to a fixed max_text_len
+    input_ids = torch.stack(input_ids_list)
+    attention_mask = torch.stack(attention_mask_list)
+    labels = torch.stack(labels_list)
 
     collated_batch = {
         'input_ids': input_ids,
@@ -181,13 +205,13 @@ def custom_collate_fn(batch):
         'labels': labels,
     }
 
-    # Conditionally add protein sequences if they exist in the batch
-    if 'wild_type_sequences' in batch[0] and batch[0]['wild_type_sequences'] is not None:
+    # Collect protein sequences if present
+    if 'wild_type_sequences' in batch[0]:
         collated_batch['wild_type_sequences'] = [item['wild_type_sequences'] for item in batch]
-    
-    if 'mutation_sequences' in batch[0] and batch[0]['mutation_sequences'] is not None:
+    if 'mutation_sequences' in batch[0]:
         collated_batch['mutation_sequences'] = [item['mutation_sequences'] for item in batch]
-        
+    # t1 = time.time()
+    # print(f"[TIME] custom_collate_fn for batch of size {len(batch)} took {t1-t0:.4f} sec")
     return collated_batch
 
 # Example of how to get delta_token_id for the model:
