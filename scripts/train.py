@@ -49,7 +49,7 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default="/data/macaulay/second/scratch/mutation2text/data/mut_text_data.json")
     require_both_sequences: bool = field(default=True)
-    max_text_len: int = field(default=512) # Max length for text tokenizer
+    max_text_len: int = field(default=4096) # Max length for text tokenizer
 
 @dataclass
 class CustomTrainingArguments(TrainingArguments):

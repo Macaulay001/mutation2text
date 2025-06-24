@@ -9,6 +9,7 @@ from torch.utils.checkpoint import checkpoint
 from einops import rearrange, repeat
 import einops
 import torch.nn.functional as F
+from llava.utils.data_utils import IGNORE_INDEX
 
 def exists(val):
     return val is not None
@@ -32,22 +33,22 @@ class FeedForward(nn.Module):
         self.fc1.weight.data = self.fc1.weight.data.to(torch.float32)
         self.fc2.weight.data = self.fc2.weight.data.to(torch.float32)
         
-        print("[DEBUG FF Init] Parameter dtypes:")
-        print(f"  norm.weight: {self.norm.weight.dtype}")
-        print(f"  norm.bias: {self.norm.bias.dtype}")
-        print(f"  fc1.weight: {self.fc1.weight.dtype}")
-        print(f"  fc2.weight: {self.fc2.weight.dtype}")
+        # print("[DEBUG FF Init] Parameter dtypes:")
+        # print(f"  norm.weight: {self.norm.weight.dtype}")
+        # print(f"  norm.bias: {self.norm.bias.dtype}")
+        # print(f"  fc1.weight: {self.fc1.weight.dtype}")
+        # print(f"  fc2.weight: {self.fc2.weight.dtype}")
 
     def forward(self, x):
         orig_dtype = x.dtype
-        print("\n[DEBUG FF Forward] Input:")
-        print(f"  x: shape={x.shape}, dtype={x.dtype}")
-        print(f"  fc1.weight: {self.fc1.weight.dtype}")
-        print(f"  fc2.weight: {self.fc2.weight.dtype}")
+        # print("\n[DEBUG FF Forward] Input:")
+        # print(f"  x: shape={x.shape}, dtype={x.dtype}")
+        # print(f"  fc1.weight: {self.fc1.weight.dtype}")
+        # print(f"  fc2.weight: {self.fc2.weight.dtype}")
         
         # Ensure LayerNorm parameters are float32 and apply LayerNorm in float32
         x_f32 = x.to(torch.float32)
-        print(f"[DEBUG FF Forward] x_f32 dtype before norm: {x_f32.dtype}")
+        # print(f"[DEBUG FF Forward] x_f32 dtype before norm: {x_f32.dtype}")
         x = F.layer_norm(
             x_f32,
             self.norm.normalized_shape,
@@ -55,28 +56,28 @@ class FeedForward(nn.Module):
             self.norm.bias.to(torch.float32),
             self.norm.eps
         )
-        print(f"[DEBUG FF Forward] x dtype after norm: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after norm: {x.dtype}")
         
         # Convert back to original dtype for the rest of processing
         x = x.to(orig_dtype)
-        print(f"[DEBUG FF Forward] x dtype after converting back: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after converting back: {x.dtype}")
         
         # Match input dtype to weight dtype for linear layers
         x = self.fc1(x.to(self.fc1.weight.dtype))
-        print(f"[DEBUG FF Forward] x dtype after fc1: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after fc1: {x.dtype}")
         
         x = self.act(x)  # GELU preserves dtype
-        print(f"[DEBUG FF Forward] x dtype after activation: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after activation: {x.dtype}")
         
         x = self.fc2(x.to(self.fc2.weight.dtype))
-        print(f"[DEBUG FF Forward] x dtype after fc2: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after fc2: {x.dtype}")
         return x
 
 # from .esm_protein_encoder import ESMProteinEncoder # Assuming this will be in the same directory
 
 # Placeholder for DELTA_TOKEN and IGNORE_INDEX, usually defined in training scripts or data utils
 # DELTA_TOKEN_ID_PLACEHOLDER = -1  # This should be dynamically set from tokenizer
-IGNORE_INDEX = -100
+# IGNORE_INDEX = -100
 
 class GatedCrossAttention(nn.Module):
     def __init__(self, query_dim, key_value_dim, output_dim, num_heads=8, dim_head=64, ff_mult=4):
@@ -93,6 +94,9 @@ class GatedCrossAttention(nn.Module):
         
         # Components for self attention (mut -> mut)
         self.to_qkv_self = nn.Linear(query_dim, inner_dim * 3, bias=False)
+
+        # Components for self attention (wt -> wt)
+        self.to_qkv_wt = nn.Linear(key_value_dim, inner_dim * 3, bias=False)
         
         # Attention-based gating mechanism
         self.gate_norm = nn.LayerNorm(inner_dim)
@@ -117,12 +121,12 @@ class GatedCrossAttention(nn.Module):
         self.ff_gate = nn.Parameter(torch.ones(1))
 
     def forward(self, query_feats, kv_feats_wt, kv_feats_mut):
-        print(f"\n[DEBUG GCA Forward] Initial dtypes:")
-        print(f"  query_feats: {query_feats.dtype}")
-        print(f"  kv_feats_wt: {kv_feats_wt.dtype}")
-        print(f"  kv_feats_mut: {kv_feats_mut.dtype}")
-        print(f"  to_q_cross.weight: {self.to_q_cross.weight.dtype}")
-        print(f"  to_kv_cross.weight: {self.to_kv_cross.weight.dtype}")
+        # print(f"\n[DEBUG GCA Forward] Initial dtypes:")
+        # print(f"  query_feats: {query_feats.dtype}")
+        # print(f"  kv_feats_wt: {kv_feats_wt.dtype}")
+        # print(f"  kv_feats_mut: {kv_feats_mut.dtype}")
+        # print(f"  to_q_cross.weight: {self.to_q_cross.weight.dtype}")
+        # print(f"  to_kv_cross.weight: {self.to_kv_cross.weight.dtype}")
 
         # Convert inputs to bfloat16 to match the model's parameters
         query_feats = query_feats.to(torch.bfloat16)
@@ -143,67 +147,88 @@ class GatedCrossAttention(nn.Module):
         k_wt = rearrange(k_wt, 'b n (h d) -> b h n d', h=self.num_heads)
         v_wt = rearrange(v_wt, 'b n (h d) -> b h n d', h=self.num_heads)
         
-        # Cross attention computation
+        # Cross attention computation between mutation and wild-type
         scale = q_cross.shape[-1] ** -0.5
         sim_wt = torch.einsum('b h i d, b h j d -> b h i j', q_cross * scale, k_wt)
         attn_wt = F.softmax(sim_wt, dim=-1)
         cross_out = torch.einsum('b h i j, b h j d -> b h i d', attn_wt, v_wt)
         cross_out = rearrange(cross_out, 'b h n d -> b n (h d)')
 
-        if kv_feats_mut is not None:
-            # 2. Self Attention (mutation -> mutation)
-            qkv_self = self.to_qkv_self(query_feats_norm)
-            q_self, k_self, v_self = qkv_self.chunk(3, dim=-1)
-            
-            # Split heads for self attention
-            q_self = rearrange(q_self, 'b n (h d) -> b h n d', h=self.num_heads)
-            k_self = rearrange(k_self, 'b n (h d) -> b h n d', h=self.num_heads)
-            v_self = rearrange(v_self, 'b n (h d) -> b h n d', h=self.num_heads)
-            
-            # Self attention computation
-            sim_self = torch.einsum('b h i d, b h j d -> b h i j', q_self * scale, k_self)
-            attn_self = F.softmax(sim_self, dim=-1)
-            self_out = torch.einsum('b h i j, b h j d -> b h i d', attn_self, v_self)
-            self_out = rearrange(self_out, 'b h n d -> b n (h d)')
-            
-            # Apply attention-based gating
-            # 1. Normalize both attention outputs
-            self_out_norm = self.gate_norm(self_out)
-            cross_out_norm = self.gate_norm(cross_out)
-            
-            # 2. Use attention mechanism to compute interaction between self and cross attention
-            gate_context, _ = self.gate_attention(
-                query=self_out_norm,
-                key=cross_out_norm,
-                value=cross_out_norm
-            )
-            
-            # 3. Generate dynamic mixing weights based on the attention context
-            batch_size, seq_len, _ = gate_context.shape
-            mixing_weights = self.to_mixing_weights(gate_context)  # [batch, seq_len, 2]
-            
-            # 4. Mix self and cross attention outputs using learned weights
-            mixed_output = (
-                mixing_weights[..., 0:1] * self_out +
-                mixing_weights[..., 1:2] * cross_out
-            )
-            
-            # Project to output dimension
-            delta = self.to_out(mixed_output)
-            
-            # Apply feedforward
-            if hasattr(self, 'ff'):
-                ff_out = self.ff(delta)
-                delta = delta + self.ff_gate * ff_out
-            
-            return delta
-        else:
-            # If no mutation features, just return processed cross-attention features
-            out = self.to_out(cross_out)
-            if hasattr(self, 'ff'):
-                ff_out = self.ff(out)
-                out = out + self.ff_gate * ff_out
-            return out
+        # 2. Self Attention (mutation -> mutation)
+        qkv_self = self.to_qkv_self(query_feats_norm)
+        q_self, k_self, v_self = qkv_self.chunk(3, dim=-1)
+        
+        # Split heads for self attention
+        q_self = rearrange(q_self, 'b n (h d) -> b h n d', h=self.num_heads)
+        k_self = rearrange(k_self, 'b n (h d) -> b h n d', h=self.num_heads)
+        v_self = rearrange(v_self, 'b n (h d) -> b h n d', h=self.num_heads)
+        
+        # Self attention computation
+        sim_self = torch.einsum('b h i d, b h j d -> b h i j', q_self * scale, k_self)
+        attn_self = F.softmax(sim_self, dim=-1)
+        self_out = torch.einsum('b h i j, b h j d -> b h i d', attn_self, v_self)
+        self_out = rearrange(self_out, 'b h n d -> b n (h d)')
+        
+        # 3. Self Attention (wild-type -> wild-type)
+        qkv_wt = self.to_qkv_wt(kv_feats_wt_norm)
+        q_wt, k_wt, v_wt = qkv_wt.chunk(3, dim=-1)
+        
+        # Split heads for self attention
+        q_wt = rearrange(q_wt, 'b n (h d) -> b h n d', h=self.num_heads)
+        k_wt = rearrange(k_wt, 'b n (h d) -> b h n d', h=self.num_heads)
+        v_wt = rearrange(v_wt, 'b n (h d) -> b h n d', h=self.num_heads)
+        
+        # Self attention computation
+        sim_wt = torch.einsum('b h i d, b h j d -> b h i j', q_wt * scale, k_wt)
+        attn_wt = F.softmax(sim_wt, dim=-1)
+        wt_out = torch.einsum('b h i j, b h j d -> b h i d', attn_wt, v_wt)
+        wt_out = rearrange(wt_out, 'b h n d -> b n (h d)')
+
+
+
+        # Apply attention-based gating
+        # 1. Normalize both attention outputs
+        self_out_norm = self.gate_norm(self_out)
+        cross_out_norm = self.gate_norm(cross_out)
+        
+        # 2. Use attention mechanism to compute interaction between self and cross attention
+        gate_context, _ = self.gate_attention(
+            query=self_out_norm,
+            key=cross_out_norm,
+            value=cross_out_norm
+        )
+        
+        # 3. Generate dynamic mixing weights based on the attention context
+        batch_size, seq_len, _ = gate_context.shape
+        mixing_weights = self.to_mixing_weights(gate_context)  # [batch, seq_len, 2]
+        
+        # 4. Mix self and cross attention outputs using learned weights
+        mixed_output = (
+            mixing_weights[..., 0:1] * self_out +
+            mixing_weights[..., 1:2] * cross_out
+        )
+        
+        # Project to output dimension
+        delta = self.to_out(mixed_output)
+        
+        # Apply feedforward
+        if hasattr(self, 'ff'):
+            ff_out = self.ff(delta)
+            delta = delta + self.ff_gate * ff_out
+
+        #prepare wt_out for resampler
+        wt_out = self.to_out(wt_out)
+        # print(f"[DEBUG GCA Forward] wt_out: {wt_out.shape}, dtype: {wt_out.dtype}")
+        # print(f"[DEBUG GCA Forward] delta: {delta.shape}, dtype: {delta.dtype}")
+        
+        return delta, wt_out
+        # else:
+        #     # If no mutation features, just return processed cross-attention features
+        #     out = self.to_out(cross_out)
+        #     if hasattr(self, 'ff'):
+        #         ff_out = self.ff(out)
+        #         out = out + self.ff_gate * ff_out
+        #     return out
         
 
 class PerceiverResampler(nn.Module):
@@ -217,13 +242,13 @@ class PerceiverResampler(nn.Module):
         self.output_dim = output_dim
         inner_dim = dim_head * num_heads
         
-        print(f"[DEBUG Resampler Init] Configuration:")
-        print(f"  input_dim: {input_dim}")
-        print(f"  output_dim: {output_dim}")
-        print(f"  num_heads: {num_heads}")
-        print(f"  dim_head: {dim_head}")
-        print(f"  inner_dim: {inner_dim}")
-        print(f"  num_output_tokens: {num_output_tokens}")
+        # print(f"[DEBUG Resampler Init] Configuration:")
+        # print(f"  input_dim: {input_dim}")
+        # print(f"  output_dim: {output_dim}")
+        # print(f"  num_heads: {num_heads}")
+        # print(f"  dim_head: {dim_head}")
+        # print(f"  inner_dim: {inner_dim}")
+        # print(f"  num_output_tokens: {num_output_tokens}")
         
         # Learnable latent vectors that will be queried against the input sequence
         self.latents = nn.Parameter(torch.randn(num_output_tokens, input_dim))
@@ -347,6 +372,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
         super().__init__(config)
 
         self.protein_config = getattr(config, 'protein_config', None)
+        self.use_context = getattr(config, 'use_context', False)
+        print(f"[DEBUG] use_context: {self.use_context}")
         print("[DEBUG] Initializing LlavaLlamaForCausalLM with protein_config:", self.protein_config)
 
         if self.protein_config is not None:
@@ -463,6 +490,21 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
             else:
                 print(f"[WARNING] Delta token ID {token_id} is out of bounds for embedding layer")
 
+    def set_wildtype_protein_token_id(self, token_id):
+        """Set the wildtype protein token ID and initialize its embeddings."""
+        self.wildtype_protein_token_id = token_id
+        if token_id is not None:
+            # Get the embedding layer
+            embed_layer = self.get_input_embeddings()
+            hidden_size = embed_layer.weight.shape[1]
+
+            # Initialize the embedding for the wildtype protein token with xavier uniform
+            if token_id < embed_layer.weight.shape[0]:
+                nn.init.xavier_uniform_(embed_layer.weight.data[token_id].view(1, hidden_size))
+                print(f"[DEBUG] Initialized embedding for wildtype protein token ID {token_id}")
+            else:
+                print(f"[WARNING] Wildtype protein token ID {token_id} is out of bounds for embedding layer")
+
     def get_protein_encoder(self):
         return self.protein_encoder # For external access if needed, e.g. freezing/unfreezing
 
@@ -509,7 +551,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
 
         # 1c. Gated Cross-Attention
         gca_start = time.time()
-        delta_features = self.mm_gated_cross_attention(
+        delta_features, wt_features = self.mm_gated_cross_attention(
             query_feats=mut_protein_features_padded,
             kv_feats_wt=wt_protein_features_padded,
             kv_feats_mut=mut_protein_features_padded
@@ -522,6 +564,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
         # 1d. Resampler
         resampler_start = time.time()
         resampled_features = self.mm_resampler(delta_features)
+        # if use_context is True, we need to resample the wildtype features
+        resampled_wt_features = None
+        if self.use_context:
+            resampled_wt_features = self.mm_resampler(wt_features)
+            
+            
         resampler_end = time.time()
         print(f"[TIME] Resampler duration: {resampler_end - resampler_start:.3f} sec")
         
@@ -529,68 +577,108 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
         after_resampler_time = time.time()
         print(f"[TIME] >>> After Resampler, before next GCA: {after_resampler_time}")
         
-        return resampled_features
+        return resampled_features, resampled_wt_features
 
     def prepare_inputs_labels_for_multimodal(
-            self, input_ids, attention_mask, labels, protein_features
+            self, input_ids, attention_mask, labels, protein_features, protein_features_wt=None
     ):
         """
         Merges protein features with text embeddings.
         protein_features: (batch_size, num_media_tokens, llm_hidden_dim) - after projector
         """
         if protein_features is None or self.delta_token_id is None:
-            return input_ids, attention_mask, labels, None # No protein features to merge
-        print(f"[DEBUG] prepare_inputs_labels_for_multimodal: input_ids shape: {input_ids.shape}, protein_features shape: {protein_features.shape}")
-        
-        batch_size, num_protein_tokens, llm_hidden_dim = protein_features.shape
-        
-        # Get LLM's token embeddings
-        token_embeddings = self.get_input_embeddings()(input_ids) # (batch_size, text_seq_len, llm_hidden_dim)
+            return input_ids, None, attention_mask, labels # No protein features to merge
+
+        batch_size, _, llm_hidden_dim = protein_features.shape
+        token_embeddings = self.get_input_embeddings()(input_ids)
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         new_attention_mask = []
 
         for i in range(batch_size):
-            # Find the position of DELTA_TOKEN_INDEX
             delta_token_indices = (input_ids[i] == self.delta_token_id).nonzero(as_tuple=True)[0]
-            
+
             if len(delta_token_indices) == 0:
                 print(f"Warning: DELTA_TOKEN_ID {self.delta_token_id} not found in input_ids sample {i}. Protein features not inserted.")
                 new_input_embeds.append(token_embeddings[i])
                 if labels is not None: new_labels.append(labels[i])
                 new_attention_mask.append(attention_mask[i])
                 continue
-
-            delta_token_idx = delta_token_indices[0] # Use the first occurrence
-
-            # Get protein features for this sample - maintain 2D shape
-            current_protein_features = protein_features[i]  # Shape: [num_protein_tokens, llm_hidden_dim]
-
-            # Split text embeddings around the delta token
-            pre_delta_embeds = token_embeddings[i, :delta_token_idx]
-            post_delta_embeds = token_embeddings[i, delta_token_idx + 1:]
             
-            print(f"[DEBUG] pre_delta_embeds shape: {pre_delta_embeds.shape}, post_delta_embeds shape: {post_delta_embeds.shape}, current_protein_features shape: {current_protein_features.shape}")
+            delta_token_idx = delta_token_indices[0]
+            current_protein_features = protein_features[i]
+            num_protein_tokens = current_protein_features.shape[0]
+
+            current_labels = labels[i] if labels is not None else None
+            current_attention_mask = attention_mask[i]
             
-            # Concatenate: text_before | protein_features | text_after
-            merged_embeds = torch.cat([pre_delta_embeds, current_protein_features, post_delta_embeds], dim=0)
+            protein_ignore_labels = torch.full((num_protein_tokens,), IGNORE_INDEX, device=labels.device, dtype=labels.dtype) if labels is not None else None
+            protein_attn_mask = torch.ones(num_protein_tokens, device=attention_mask.device, dtype=attention_mask.dtype)
+
+            merged_embeds, merged_labels, merged_mask = None, None, None
+
+            if self.use_context:
+                wt_token_indices = (input_ids[i] == self.wildtype_protein_token_id).nonzero(as_tuple=True)[0]
+                if len(wt_token_indices) > 0:
+                    wt_token_idx = wt_token_indices[0]
+                    current_wt_features = protein_features_wt[i]
+                    num_wt_protein_tokens = current_wt_features.shape[0]
+                    wt_protein_ignore_labels = torch.full((num_wt_protein_tokens,), IGNORE_INDEX, device=labels.device, dtype=labels.dtype) if labels is not None else None
+                    wt_protein_attn_mask = torch.ones(num_wt_protein_tokens, device=attention_mask.device, dtype=attention_mask.dtype)
+
+                    if delta_token_idx < wt_token_idx:
+                        merged_embeds = torch.cat([
+                            token_embeddings[i, :delta_token_idx], current_protein_features,
+                            token_embeddings[i, delta_token_idx + 1:wt_token_idx], current_wt_features,
+                            token_embeddings[i, wt_token_idx + 1:]
+                        ], dim=0)
+                        if current_labels is not None:
+                            merged_labels = torch.cat([
+                                current_labels[:delta_token_idx], protein_ignore_labels,
+                                current_labels[delta_token_idx + 1:wt_token_idx], wt_protein_ignore_labels,
+                                current_labels[wt_token_idx + 1:]
+                            ], dim=0)
+                        merged_mask = torch.cat([
+                            current_attention_mask[:delta_token_idx], protein_attn_mask,
+                            current_attention_mask[delta_token_idx + 1:wt_token_idx], wt_protein_attn_mask,
+                            current_attention_mask[wt_token_idx + 1:]
+                        ], dim=0)
+                    else: # wt before delta
+                        merged_embeds = torch.cat([
+                            token_embeddings[i, :wt_token_idx], current_wt_features,
+                            token_embeddings[i, wt_token_idx + 1:delta_token_idx], current_protein_features,
+                            token_embeddings[i, delta_token_idx + 1:]
+                        ], dim=0)
+                        if current_labels is not None:
+                            merged_labels = torch.cat([
+                                current_labels[:wt_token_idx], wt_protein_ignore_labels,
+                                current_labels[wt_token_idx + 1:delta_token_idx], protein_ignore_labels,
+                                current_labels[delta_token_idx + 1:]
+                            ], dim=0)
+                        merged_mask = torch.cat([
+                            current_attention_mask[:wt_token_idx], wt_protein_attn_mask,
+                            current_attention_mask[wt_token_idx + 1:delta_token_idx], protein_attn_mask,
+                            current_attention_mask[delta_token_idx + 1:]
+                        ], dim=0)
+                else: # Fallback to delta only if wt token not found
+                    print(f"Warning: WILDTYPE_PROTEIN_TOKEN_ID not found. Only inserting delta features.")
+
+            # This block handles delta-only case, and the fallback from context case
+            if merged_embeds is None:
+                pre_delta_embeds = token_embeddings[i, :delta_token_idx]
+                post_delta_embeds = token_embeddings[i, delta_token_idx + 1:]
+                merged_embeds = torch.cat([pre_delta_embeds, current_protein_features, post_delta_embeds], dim=0)
+                if current_labels is not None:
+                    pre_delta_labels = current_labels[:delta_token_idx]
+                    post_delta_labels = current_labels[delta_token_idx + 1:]
+                    merged_labels = torch.cat([pre_delta_labels, protein_ignore_labels, post_delta_labels], dim=0)
+                pre_delta_mask = current_attention_mask[:delta_token_idx]
+                post_delta_mask = current_attention_mask[delta_token_idx + 1:]
+                merged_mask = torch.cat([pre_delta_mask, protein_attn_mask, post_delta_mask], dim=0)
+
             new_input_embeds.append(merged_embeds)
-
-            if labels is not None:
-                pre_delta_labels = labels[i, :delta_token_idx]
-                # Protein feature labels: IGNORE_INDEX
-                protein_labels = torch.full((num_protein_tokens,), IGNORE_INDEX, 
-                                            device=labels.device, dtype=labels.dtype)
-                post_delta_labels = labels[i, delta_token_idx + 1:]
-                merged_labels = torch.cat([pre_delta_labels, protein_labels, post_delta_labels], dim=0)
-                new_labels.append(merged_labels)
-            
-            # Update attention mask
-            pre_delta_mask = attention_mask[i, :delta_token_idx]
-            protein_mask = torch.ones(num_protein_tokens, device=attention_mask.device, dtype=attention_mask.dtype)
-            post_delta_mask = attention_mask[i, delta_token_idx + 1:]
-            merged_mask = torch.cat([pre_delta_mask, protein_mask, post_delta_mask], dim=0)
+            if labels is not None: new_labels.append(merged_labels)
             new_attention_mask.append(merged_mask)
 
         # Pad sequences to max length in batch
@@ -643,7 +731,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
 
             # 1. Process protein sequences through GCA and Resampler
             # Output: (batch_size, 1, num_media_tokens, resampler_output_dim)
-            protein_features_resampled = self.apply_GCA_resampler(
+            protein_features_resampled, protein_features_resampled_wt = self.apply_GCA_resampler(
                 wild_type_seqs_list=wild_type_sequences,
                 mutation_seqs_list=mutation_sequences
             )
@@ -652,6 +740,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
             # Input: (batch_size, 1, num_media_tokens, resampler_output_dim)
             # Output: (batch_size, 1, num_media_tokens, llm_hidden_dim)
             protein_features_projected = self.mm_projector(protein_features_resampled)
+            if self.use_context:
+                protein_features_projected_wt = self.mm_projector(protein_features_resampled_wt)
 
         if inputs_embeds is None and protein_features_projected is not None:
             # 3. Integrate with LLM Embeddings
@@ -659,7 +749,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
-                protein_features=protein_features_projected
+                protein_features=protein_features_projected,
+                protein_features_wt=protein_features_projected_wt
             )
             # After this, input_ids might be None if inputs_embeds is returned,
             # or input_ids is effectively replaced by the process that generates inputs_embeds.

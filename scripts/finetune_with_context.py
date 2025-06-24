@@ -35,6 +35,9 @@ class ModelArguments:
     # Path to pretrained GCA/Resampler/Projector (output of pretrain_gca.sh)
     pretrained_adapter_path: Optional[str] = field(default="./output/pretrain_gca/", metadata={"help": "Path to the pretrained GCA/Resampler/Projector checkpoint."})
     
+    # Path to a pretrained LoRA adapter to continue finetuning
+    lora_adapter_path: Optional[str] = field(default=None, metadata={"help": "Path to a pretrained LoRA adapter to continue finetuning."})
+    
     # LoRA specific arguments
     lora_enable: bool = field(default=True) # Enable LoRA for finetuning
     lora_r: int = field(default=16)
@@ -56,6 +59,7 @@ class DataArguments:
     eval_data_path: Optional[str] = field(default="/data/macaulay/Mutation2Text/data/finetune_eval_data.json")
     require_both_sequences: bool = field(default=True)
     max_text_len: int = field(default=4096)
+    
 
 @dataclass
 class CustomTrainingArguments(TrainingArguments):
@@ -77,6 +81,7 @@ class CustomTrainingArguments(TrainingArguments):
     report_to: str = field(default="tensorboard")
     do_train: bool = field(default=True)
     mode: str = field(default="train")
+    use_context: bool = field(default=True)
     
 
 @dataclass
@@ -187,7 +192,8 @@ def main():
         data_path=data_args.data_path,
         tokenizer=tokenizer,
         max_text_len=data_args.max_text_len,
-        require_both_sequences=data_args.require_both_sequences
+        require_both_sequences=data_args.require_both_sequences,
+        use_context=training_args.use_context
     )
 
     eval_dataset = None
@@ -197,7 +203,8 @@ def main():
                 data_path=data_args.eval_data_path,
                 tokenizer=tokenizer,
                 max_text_len=data_args.max_text_len,
-                require_both_sequences=data_args.require_both_sequences
+                require_both_sequences=data_args.require_both_sequences,
+                use_context=training_args.use_context
             )
         else:
             print(f"Warning: `do_eval` is True, but `eval_data_path` ({data_args.eval_data_path}) is not provided or does not exist. No evaluation will be performed.")

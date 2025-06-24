@@ -18,6 +18,7 @@ model_args:
 data_args:
   data_path: /data/macaulay/Mutation2Text/data/mut_text_data.json
   require_both_sequences: True
+  max_text_len: 1536
   # DELTA_TOKEN: "<delta_P>" # Defined in code, but useful to note here
   # IGNORE_INDEX: -100 # Standard for labels to ignore
 

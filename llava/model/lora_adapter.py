@@ -12,20 +12,20 @@ def create_lora_model(model, lora_config_params):
     Returns:
         PeftModel: The LoRA-adapted model.
     """
-    # Ensure all necessary LoRA parameters are present
-    required_params = ['r', 'lora_alpha', 'target_modules', 'lora_dropout']
+    # Ensure all necessary LoRA parameters are present on the ModelArguments object
+    required_params = ['lora_r', 'lora_alpha', 'lora_target_modules', 'lora_dropout']
     for param in required_params:
-        if param not in lora_config_params:
+        if not hasattr(lora_config_params, param):
             raise ValueError(f"Missing required LoRA config parameter: {param}")
 
-    # Create the LoRA config
+    # Create the LoRA config from the attributes of the dataclass
     config = LoraConfig(
-        r=lora_config_params['r'],
-        lora_alpha=lora_config_params['lora_alpha'],
-        target_modules=lora_config_params['target_modules'], # e.g., ["q_proj", "v_proj"]
-        lora_dropout=lora_config_params['lora_dropout'],
-        bias=lora_config_params.get('bias', "none"), # common values: "none", "all", "lora_only"
-        task_type=lora_config_params.get('task_type', TaskType.CAUSAL_LM) # Default to Causal LM
+        r=lora_config_params.lora_r,
+        lora_alpha=lora_config_params.lora_alpha,
+        target_modules=lora_config_params.lora_target_modules,
+        lora_dropout=lora_config_params.lora_dropout,
+        bias=getattr(lora_config_params, 'lora_bias', "none"),
+        task_type=getattr(lora_config_params, 'task_type', TaskType.CAUSAL_LM)
     )
 
     # Identify which parameters should be trainable before applying PEFT

@@ -7,10 +7,11 @@ import time
 # Define special tokens if they are consistent across the project
 # These should match what's used in model training and configuration
 DELTA_TOKEN = "<delta_P>"
+WILDTYPE_PROTEIN_TOKEN = "<wt_protein>"
 IGNORE_INDEX = -100
 
 class MutationTextDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_text_len=512, require_both_sequences=True):
+    def __init__(self, data_path, tokenizer, max_text_len=2048, require_both_sequences=True, use_context=False):
         """
         Initialize the dataset.
         Args:
@@ -18,21 +19,25 @@ class MutationTextDataset(Dataset):
             tokenizer: Pre-configured tokenizer instance
             max_text_len: Maximum text length for tokenization
             require_both_sequences: Whether both wild type and mutation sequences are required
+            use_context: Whether to use context in the input
         """
         self.data_path = data_path
         self.tokenizer = tokenizer  # Use the pre-configured tokenizer
+        self.use_context = use_context
         
         # Ensure padding token is set
         if self.tokenizer.pad_token is None:
             print("[DEBUG] Setting pad_token to eos_token in dataset")
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Add the special delta token if it's not already part of the tokenizer
-        if DELTA_TOKEN not in self.tokenizer.additional_special_tokens:
+        # Add special tokens if they don't already exist in the tokenizer
+        if self.use_context and WILDTYPE_PROTEIN_TOKEN not in self.tokenizer.get_vocab():
+            self.tokenizer.add_special_tokens({'additional_special_tokens': [WILDTYPE_PROTEIN_TOKEN]})
+        if DELTA_TOKEN not in self.tokenizer.get_vocab():
             self.tokenizer.add_special_tokens({'additional_special_tokens': [DELTA_TOKEN]})
-            # The model's token embeddings will need to be resized accordingly
         
         self.delta_token_id = self.tokenizer.convert_tokens_to_ids(DELTA_TOKEN)
+        self.wildtype_protein_token_id = self.tokenizer.convert_tokens_to_ids(WILDTYPE_PROTEIN_TOKEN)
         self.max_text_len = max_text_len
         self.require_both_sequences = require_both_sequences
         self.samples = self._load_data()
@@ -42,6 +47,7 @@ class MutationTextDataset(Dataset):
         print(f"[DEBUG] - pad_token: {self.tokenizer.pad_token}")
         print(f"[DEBUG] - pad_token_id: {self.tokenizer.pad_token_id}")
         print(f"[DEBUG] - delta_token_id: {self.delta_token_id}")
+        print(f"[DEBUG] - wildtype_protein_token_id: {self.wildtype_protein_token_id}")
         print(f"[DEBUG] - max_text_len: {self.max_text_len}")
         print(f"[DEBUG] - num_samples: {len(self.samples)}")
 
@@ -116,7 +122,10 @@ class MutationTextDataset(Dataset):
         # Sanitize inputs
         system_prompt = "You are a helpful assistant that explains protein mutations."
         human_query = self._sanitize_text(human_query)
-        processed_query = human_query.replace("<wt_prot_seq> <mut_prot_seq>", DELTA_TOKEN)
+        if not self.use_context:
+            processed_query = human_query.replace("<wt_prot_seq> <mut_prot_seq>", DELTA_TOKEN)
+        else:
+            processed_query = human_query
         # print(f"[DEBUG] Processed query for idx {idx}: {processed_query}")
         text_input_for_tokenization = f"{system_prompt}\n\nHuman: {processed_query} \n\nAssistant:"
         # text_input_for_tokenization = self._sanitize_text(human_query.replace("<wt_prot_seq>\n<mut_prot_seq>", DELTA_TOKEN))
@@ -157,7 +166,7 @@ class MutationTextDataset(Dataset):
             }
 
         input_ids = tokenized_input.input_ids.squeeze(0)
-        unique_tokens = torch.unique(input_ids)
+        # unique_tokens = torch.unique(input_ids)
         # print(f"[DEBUG] Unique tokens in input for idx {idx}: {unique_tokens.tolist()}")
 
 
