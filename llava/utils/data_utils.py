@@ -6,42 +6,37 @@ import time
 
 # Define special tokens if they are consistent across the project
 # These should match what's used in model training and configuration
-DELTA_TOKEN = "<delta_P>"
+# DELTA_TOKEN = "<delta_P>"
+# WILDTYPE_PROTEIN_TOKEN = "<wt_protein>"
 IGNORE_INDEX = -100
+WT_PROTEIN_START_TOKEN = "<wt_protein>"
+WT_PROTEIN_END_TOKEN = "</wt_protein>"
+MUT_PROTEIN_START_TOKEN = "<mut_protein>"
+MUT_PROTEIN_END_TOKEN = "</mut_protein>"
 
 class MutationTextDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_text_len=512, require_both_sequences=True):
+    def __init__(self, data_path, tokenizer, max_text_len=2048):
         """
         Initialize the dataset.
         Args:
             data_path: Path to the JSON data file
             tokenizer: Pre-configured tokenizer instance
             max_text_len: Maximum text length for tokenization
-            require_both_sequences: Whether both wild type and mutation sequences are required
         """
         self.data_path = data_path
-        self.tokenizer = tokenizer  # Use the pre-configured tokenizer
+        self.tokenizer = tokenizer
         
-        # Ensure padding token is set
-        if self.tokenizer.pad_token is None:
-            print("[DEBUG] Setting pad_token to eos_token in dataset")
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Add the special delta token if it's not already part of the tokenizer
-        if DELTA_TOKEN not in self.tokenizer.additional_special_tokens:
-            self.tokenizer.add_special_tokens({'additional_special_tokens': [DELTA_TOKEN]})
-            # The model's token embeddings will need to be resized accordingly
-        
-        self.delta_token_id = self.tokenizer.convert_tokens_to_ids(DELTA_TOKEN)
         self.max_text_len = max_text_len
-        self.require_both_sequences = require_both_sequences
         self.samples = self._load_data()
         
         # Debug information
         print(f"[DEBUG] Dataset initialized with:")
         print(f"[DEBUG] - pad_token: {self.tokenizer.pad_token}")
         print(f"[DEBUG] - pad_token_id: {self.tokenizer.pad_token_id}")
-        print(f"[DEBUG] - delta_token_id: {self.delta_token_id}")
+        # print(f"[DEBUG] - wt_protein_start_token_id: {self.tokenizer.wt_protein_start_token_id}")
+        # print(f"[DEBUG] - wt_protein_end_token_id: {self.tokenizer.wt_protein_end_token_id}")
+        # print(f"[DEBUG] - mut_protein_start_token_id: {self.tokenizer.mut_protein_start_token_id}")
+        # print(f"[DEBUG] - mut_protein_end_token_id: {self.tokenizer.mut_protein_end_token_id}")
         print(f"[DEBUG] - max_text_len: {self.max_text_len}")
         print(f"[DEBUG] - num_samples: {len(self.samples)}")
 
@@ -60,6 +55,11 @@ class MutationTextDataset(Dataset):
         for item_from_list in raw_data_list:
             wild_type_seq = item_from_list.get("wild_type_seq")
             mutation_seq = item_from_list.get("mutation_seq")
+            
+            # Convert string "None" to actual None
+            if mutation_seq == "None":
+                mutation_seq = None
+
             conversations = item_from_list.get("conversations", [])
 
             human_query = ""
@@ -73,9 +73,6 @@ class MutationTextDataset(Dataset):
                         elif conv_item.get("from") == "gpt":
                             gpt_response = conv_item.get("value", "")
 
-            # Basic filtering (optional, can be done upstream or based on flags)
-            if self.require_both_sequences and (not wild_type_seq or not mutation_seq):
-                continue
             # We now require both human_query and gpt_response to be present
             if not human_query or not gpt_response:
                  print(f"Warning: Record {item_from_list.get('id', 'Unknown ID')} is missing human query or gpt response.")
@@ -88,6 +85,8 @@ class MutationTextDataset(Dataset):
                 "gpt_response": gpt_response,
                 "id": item_from_list.get("id") # Preserve ID if present, for debugging
             }
+
+            print(f"[DEBUG] processed_record: {processed_record}")
             samples.append(processed_record)
         return samples
 
@@ -109,72 +108,97 @@ class MutationTextDataset(Dataset):
         t0 = time.time()
         record = self.samples[idx]
         wild_type_seq = record.get("wild_type_seq", "")
-        mutation_seq = record.get("mutation_seq", "")
-        human_query = record.get("human_query", "") # Get the original human query
+        mutation_seq = record.get("mutation_seq") # Can be None now
+        human_query = record.get("human_query", "")
         gpt_response = record.get("gpt_response", "")
+
+        # Determine attention mode
+        has_delta = MUT_PROTEIN_START_TOKEN in human_query
+        has_wt = WT_PROTEIN_START_TOKEN in human_query
+
+        print(f"[DEBUG] Sample {idx}:")
+        print(f"  - has_delta: {has_delta}")
+        print(f"  - has_wt: {has_wt}")
+        
+        if has_delta and has_wt:
+            attention_mode = 'full'
+        elif has_delta:
+            attention_mode = 'delta_only'
+        elif has_wt:
+            attention_mode = 'wt_only'
+        else:
+            # Default or error case if no special tokens are found
+            attention_mode = 'text_only'
+
+        print(f"[DEBUG] attention_mode: {attention_mode}")
+        print(f"[DEBUG] human_query: {human_query}")
 
         # Sanitize inputs
         system_prompt = "You are a helpful assistant that explains protein mutations."
         human_query = self._sanitize_text(human_query)
-        processed_query = human_query.replace("<wt_prot_seq> <mut_prot_seq>", DELTA_TOKEN)
-        # print(f"[DEBUG] Processed query for idx {idx}: {processed_query}")
-        text_input_for_tokenization = f"{system_prompt}\n\nHuman: {processed_query} \n\nAssistant:"
-        # text_input_for_tokenization = self._sanitize_text(human_query.replace("<wt_prot_seq>\n<mut_prot_seq>", DELTA_TOKEN))
+        text_input_for_tokenization = f"{system_prompt}\n\nHuman: {human_query} \n\nAssistant:"
         gpt_response = self._sanitize_text(gpt_response)
-
-        # print(f"[DEBUG] Tokenizing input: {text_input_for_tokenization}: gpt_response: {gpt_response}")
         
-        try:
-            # Tokenize the prepared text input
-            tokenized_input = self.tokenizer(
-                text_input_for_tokenization,
-                padding="max_length",
-                truncation=True,
-                max_length=self.max_text_len,
-                return_tensors="pt"
-            )
+        # This is the standard way to format inputs for a Causal LM.
+        # The model sees the full text, but loss is only calculated on the response part.
+        # We also append the EOS token to signal the end of the generation.
+        full_text = f"{text_input_for_tokenization}{gpt_response}{self.tokenizer.eos_token}"
 
-            # Tokenize gpt response for labels
-            tokenized_label = self.tokenizer(
-                gpt_response,
+        try:
+            # Tokenize the full conversation
+            tokenized_full = self.tokenizer(
+                full_text,
                 padding="max_length",
                 truncation=True,
                 max_length=self.max_text_len,
                 return_tensors="pt"
             )
+            input_ids = tokenized_full.input_ids.squeeze(0)
+            attention_mask = tokenized_full.attention_mask.squeeze(0)
+
+            # Create labels by cloning input_ids and masking the prompt
+            labels = input_ids.clone()
+
+            # Tokenize the prompt-only part to find its length for masking
+            tokenized_prompt = self.tokenizer(
+                text_input_for_tokenization,
+                padding=False, # No padding, we just need the length
+                truncation=True,
+                max_length=self.max_text_len,
+                return_tensors="pt"
+            )
+            prompt_len = tokenized_prompt.input_ids.shape[1]
+
+            # Mask the prompt part of the labels
+            labels[:prompt_len] = IGNORE_INDEX
+            
+            # Also mask padding tokens in the labels
+            labels[attention_mask == 0] = IGNORE_INDEX
 
         except Exception as e:
-            print(f"[ERROR] Tokenization failed for idx {idx}: {str(e)}")
+            print(f"[WARNING] Tokenization failed for idx {idx}: {str(e)}")
             # Return a default/empty item if tokenization fails
             empty_tensor = torch.zeros((self.max_text_len,), dtype=torch.long)
+            attention_mask = torch.zeros((self.max_text_len,), dtype=torch.long)
+            labels = empty_tensor.clone().fill_(IGNORE_INDEX)
             return {
                 "input_ids": empty_tensor,
-                "attention_mask": empty_tensor,
-                "labels": empty_tensor.fill_(IGNORE_INDEX),
+                "attention_mask": attention_mask,
+                "labels": labels,
                 "id": record.get("id", f"index_{idx}"),
                 "wild_type_sequences": "",
-                "mutation_sequences": ""
+                "mutation_sequences": "",
+                "attention_mode": attention_mode,
             }
-
-        input_ids = tokenized_input.input_ids.squeeze(0)
-        unique_tokens = torch.unique(input_ids)
-        # print(f"[DEBUG] Unique tokens in input for idx {idx}: {unique_tokens.tolist()}")
-
-
-        attention_mask = tokenized_input.attention_mask.squeeze(0)
-        labels = tokenized_label.input_ids.squeeze(0)
-
-        # Set labels to IGNORE_INDEX for padding tokens in the label sequence
-        labels[labels == self.tokenizer.pad_token_id] = IGNORE_INDEX
 
         item = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "id": record.get("id", f"index_{idx}"),
-            # Include protein sequences separately for the model's protein encoder
             "wild_type_sequences": wild_type_seq,
             "mutation_sequences": mutation_seq,
+            "attention_mode": attention_mode,
         }
 
         t1 = time.time()
@@ -209,14 +233,10 @@ def custom_collate_fn(batch):
     if 'wild_type_sequences' in batch[0]:
         collated_batch['wild_type_sequences'] = [item['wild_type_sequences'] for item in batch]
     if 'mutation_sequences' in batch[0]:
+        # This list can now contain None values
         collated_batch['mutation_sequences'] = [item['mutation_sequences'] for item in batch]
-    # t1 = time.time()
-    # print(f"[TIME] custom_collate_fn for batch of size {len(batch)} took {t1-t0:.4f} sec")
+    
+    # Collect attention modes
+    if 'attention_mode' in batch[0]:
+        collated_batch['attention_mode'] = [item['attention_mode'] for item in batch]
     return collated_batch
-
-# Example of how to get delta_token_id for the model:
-# tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B-Instruct")
-# tokenizer.add_special_tokens({'additional_special_tokens': [DELTA_TOKEN]})
-# DELTA_TOKEN_ID = tokenizer.convert_tokens_to_ids(DELTA_TOKEN)
-# model.set_delta_token_id(DELTA_TOKEN_ID) # Assuming a setter in your LlavaLlamaForCausalLM
-# model.resize_token_embeddings(len(tokenizer)) # Important!

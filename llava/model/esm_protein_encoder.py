@@ -18,6 +18,9 @@ class ESMProteinEncoder(nn.Module):
         if kwargs:
             print(f"ESMProteinEncoder (ESM3 SDK) received unused kwargs: {kwargs}")
 
+        # By calling _init_client here, we ensure that output_embedding_dim is available after instantiation.
+        self._init_client() # This will initialize on CPU by default. .to(device) will re-init on GPU if called later.
+
     def _init_client(self):
         if self.client is None:
             if self._device is None:
@@ -149,39 +152,3 @@ class ESMProteinEncoder(nn.Module):
         if self.client:
             self.client.eval()
         return self
-
-# Example Usage (Conceptual)
-# if __name__ == '__main__':
-#     # Ensure you have internet or the model cached
-#     # For "esm3_sm_open_v1" you might need to refer to specific Hugging Face model hub IDs if available, or use OpenFold/ESM team's official releases.
-#     # Using a standard ESM2 model for this example as esm3_sm_open_v1 might not be directly on HF hub under that exact name.
-#     # Replace with actual esm3 model name if different on Hugging Face.
-#     try:
-#         encoder = ESMProteinEncoder(model_name_or_path="facebook/esm2_t6_8M_UR50D") # Example small ESM model
-#     except Exception as e:
-#         print(f"Failed to load model: {e}")
-#         print("Please ensure the model name is correct and you have internet access / model is cached.")
-#         exit()
-
-#     encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
-#     encoder.eval() # Set to evaluation mode, and it internally handles no_grad for ESM
-
-#     sequences = [
-#         "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG",
-#         "MKTAYIAHAADAPMFKGFDRVEAGYAVIKARARQLPGEMVEEMRIDVGPALKIPAVADD",
-#         "MAVPETNPLRADDDVGKALSTNDFLQFETARKYGVDLSALERIHRALKIDGESCM"
-#     ]
-    
-#     # Get per-residue embeddings from the last layer
-#     # (batch_size, seq_len, hidden_dim)
-#     residue_embeddings = encoder(sequences, select_layer=-1, average_embeddings=False)
-#     print("Residue Embeddings Shape:", residue_embeddings.shape)
-
-#     # Get sequence-level (averaged) embeddings from the second to last layer
-#     # (batch_size, hidden_dim)
-#     sequence_embeddings = encoder(sequences, select_layer=-2, average_embeddings=True)
-#     print("Sequence Embeddings Shape:", sequence_embeddings.shape)
-
-#     # Test with specific max length for padding/truncation
-#     fixed_len_embeddings = encoder(sequences, select_layer=-1, average_embeddings=False, max_length=50)
-#     print("Fixed Length Embeddings Shape:", fixed_len_embeddings.shape) 

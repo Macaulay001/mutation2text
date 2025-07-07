@@ -15,8 +15,6 @@ from transformers import (
 )
 from custom_trainer import CustomRNGTrainer
 
-# Add project root to sys.path to allow direct import of project modules
-# This assumes the script is run from the root of the mutation2text directory or `scripts` subdir
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 print(f"[DEBUG] PROJECT_ROOT set to: {PROJECT_ROOT}")
 if PROJECT_ROOT not in sys.path:
@@ -29,7 +27,7 @@ from llava.utils.model_utils import load_model_and_tokenizer
 class ModelArguments:
     model_name_or_path: str = field(default="meta-llama/Meta-Llama-3.1-8B-Instruct")
     protein_encoder_name_or_path: str = field(default="esm3_sm_open_v1")
-    mm_use_resampler_gca: bool = field(default=True)
+    mm_resampler: bool = field(default=True)
     mm_gated_cross_attention: bool = field(default=True)
     mm_projector_type: str = field(default="mlp2x_gelu")
     num_media_tokens: int = field(default=128)
@@ -37,18 +35,19 @@ class ModelArguments:
     tune_mm_mlp_adapter: bool = field(default=True) # Crucial for pretraining adapters
     use_mm_proj: bool = field(default=True)
     pretrained_adapter_path: Optional[str] = field(default=None) # For resuming pretraining
-    esm_hidden_size: int = field(default=1280, metadata={"help": "Hidden size of the ESM protein encoder"})
+    esm_hidden_size: int = field(default=1536, metadata={"help": "Hidden size of the ESM protein encoder"})
     dim_head: int = field(default=64, metadata={"help": "Dimension of the attention head for GCA"})
     ff_mult: int = field(default=4, metadata={"help": "Feedforward multiplier for GCA and projector"})
     perceiver_depth: int = field(default=6, metadata={"help": "Depth of the perceiver for GCA"})
     # mode: str = field(default="train", metadata={"help": "Mode: 'train' or 'inference'"})
     lora_enable: bool = field(default=False, metadata={"help": "Disable LoRA for model pretraining"})
-    # Potentially add gca_output_dim, resampler_output_dim if not auto-inferred
+    resampler_output_dim: int = field(default=1536, metadata={"help": "Output dimension of the resampler"})
+    mm_gca_num_heads: int = field(default=8, metadata={"help": "Number of heads for GCA"})
+    mm_resampler_num_heads: int = field(default=8, metadata={"help": "Number of heads for resampler"})
 
 @dataclass
 class DataArguments:
     data_path: str = field(default="/data/macaulay/second/scratch/mutation2text/data/mut_text_data.json")
-    require_both_sequences: bool = field(default=True)
     max_text_len: int = field(default=512) # Max length for text tokenizer
 
 @dataclass
@@ -100,60 +99,86 @@ def load_config_from_yaml(yaml_path: str) -> Dict[str, Any]:
 def main():
     start_total = time.time()
 
-    # Parser for all argument groups including the custom script arguments like model_config_file
+    # First parse CLI args to get the config file path and any overrides
     parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments, ScriptArguments))
-    print(f"[DEBUG] Argument parser initialized with classes: {parser}")
-
-    # Initial parse of CLI arguments. sys.argv[1:] includes args from shell + deepspeed.
-    # This parse will populate all dataclasses based on defaults and CLI overrides.
-    # We use `look_for_args_file=False` to prevent HfArgumentParser's own args file loading.
     cli_model_args, cli_data_args, cli_training_args, cli_script_args = \
         parser.parse_args_into_dataclasses(args=sys.argv[1:], look_for_args_file=False)
 
     yaml_config_path = cli_script_args.model_config_file
-    print(f"model args: {cli_model_args}, data args: {cli_data_args} , tran_arg: {cli_training_args}, script arg: {cli_script_args}")
     print(f"[CHECK] model_config_file argument: {yaml_config_path}")
 
     if yaml_config_path:
         if not os.path.exists(yaml_config_path):
-            raise FileNotFoundError(f"YAML config file '{yaml_config_path}' not found. Passed via --model_config_file.")
-        print(f"Loading configuration from YAML: {yaml_config_path}")
+            raise FileNotFoundError(f"YAML config file '{yaml_config_path}' not found.")
+        print(f"\n=== Loading config from {yaml_config_path} ===")
         yaml_configs = load_config_from_yaml(yaml_config_path)
-        print(f"[DEBUG] Loaded YAML configuration: {yaml_configs}") 
-
-        print("[DEBUG] Loading configuration from YAML file.")
-        # Prepare a list of arguments: YAML values first, then CLI arguments.
-        # HfArgumentParser will use the last occurrence for an argument, effectively making CLI override YAML.
-        flat_yaml_args = []
-        if 'model_args' in yaml_configs:
-            for k, v in yaml_configs['model_args'].items(): flat_yaml_args.extend([f'--{k}', str(v)])
-        if 'data_args' in yaml_configs:
-            for k, v in yaml_configs['data_args'].items(): flat_yaml_args.extend([f'--{k}', str(v)])
-        if 'training_args' in yaml_configs:
-            for k, v in yaml_configs['training_args'].items(): flat_yaml_args.extend([f'--{k}', str(v)])
-        # ScriptArguments like model_config_file are typically not in the YAML itself, but read from CLI first.
-
-        print(flat_yaml_args)
-        # Combine YAML-derived args with the original CLI args.
-        final_args_to_parse = flat_yaml_args + sys.argv[1:]
         
-        # Re-parse to get the final arguments with YAML defaults and CLI overrides.
+        print("\nYAML Config Contents:")
+        print("model_args:", yaml_configs.get('model_args', {}))
+        print("data_args:", yaml_configs.get('data_args', {}))
+        print("training_args:", yaml_configs.get('training_args', {}))
+
+        # Convert YAML config to command-line style arguments
+        flat_yaml_args = []
+        for section in ['model_args', 'data_args', 'training_args']:
+            if section in yaml_configs:
+                for k, v in yaml_configs[section].items():
+                    flat_yaml_args.extend([f'--{k}', str(v)])
+        
+        print("\nConverted YAML to arguments:", flat_yaml_args)
+        
+        # Parse everything together, YAML first then CLI (so CLI overrides YAML)
         model_args, data_args, training_args, script_args = \
-            parser.parse_args_into_dataclasses(args=final_args_to_parse, look_for_args_file=False)
+            parser.parse_args_into_dataclasses(args=flat_yaml_args + sys.argv[1:], look_for_args_file=False)
+        
+        print("\nSuccessfully loaded config")
     else:
-        # No YAML file specified, so the initial CLI parse is the final set of arguments.
+        # No YAML file, use CLI args only
         model_args, data_args, training_args, script_args = \
             cli_model_args, cli_data_args, cli_training_args, cli_script_args
+        print("\nNo config file provided, using CLI arguments")
 
-    print("[DEBUG] Parsing CLI arguments.")
-    # Ensure training_args.deepspeed is correctly set if provided in YAML and used by Trainer
-    if hasattr(training_args, 'deepspeed') and isinstance(training_args.deepspeed, str):
-        if not os.path.exists(training_args.deepspeed):
-            print(f"Warning: DeepSpeed config file specified in training_args ({training_args.deepspeed}) does not exist.")
+    # Print effective configuration
+    print("\n=== Effective Configuration ===")
+    print("Model Arguments:", asdict(model_args))
+    print("Data Arguments:", asdict(data_args))
+    print("Training Arguments:", asdict(training_args))
+    print("===============================\n")
 
-    print("[DEBUG] Effective Model Arguments:", asdict(model_args))
-    print("[DEBUG] Effective Data Arguments:", asdict(data_args))
-    print("[DEBUG] Effective Training Arguments:", training_args)
+    # Load YAML config if provided
+    if script_args.model_config_file:
+        if not os.path.exists(script_args.model_config_file):
+            raise FileNotFoundError(f"Config file not found: {script_args.model_config_file}")
+        
+        print(f"\n=== Loading config from {script_args.model_config_file} ===")
+        with open(script_args.model_config_file, 'r') as f:
+            yaml_config = yaml.safe_load(f)
+
+        print("\nYAML Config Contents:")
+        print("model_args:", yaml_config.get('model_args', {}))
+        print("data_args:", yaml_config.get('data_args', {}))
+        print("training_args:", yaml_config.get('training_args', {}))
+
+        # Apply YAML configs section by section
+        if 'model_args' in yaml_config:
+            for k, v in yaml_config['model_args'].items():
+                if hasattr(model_args, k):
+                    setattr(model_args, k, v)
+                    print(f"Set model_args.{k} = {v}")
+
+        if 'data_args' in yaml_config:
+            for k, v in yaml_config['data_args'].items():
+                if hasattr(data_args, k):
+                    setattr(data_args, k, v)
+                    print(f"Set data_args.{k} = {v}")
+
+        if 'training_args' in yaml_config:
+            for k, v in yaml_config['training_args'].items():
+                if hasattr(training_args, k):
+                    setattr(training_args, k, v)
+                    print(f"Set training_args.{k} = {v}")
+
+        print("\nSuccessfully applied YAML config")
 
     # Auto-detect the latest checkpoint if resuming is enabled
     if training_args.output_dir and os.path.exists(training_args.output_dir):
@@ -206,12 +231,10 @@ def main():
     print(f"[DEBUG] Using data path: {data_args.data_path}")
     print(f"[DEBUG] Tokenizer model: {model_args.model_name_or_path}")
     print(f"[DEBUG] Max text length: {data_args.max_text_len}")
-    print(f"[DEBUG] Require both sequences: {data_args.require_both_sequences}")
     train_dataset = MutationTextDataset(
         data_path=data_args.data_path,
         tokenizer=tokenizer,  # Pass the configured tokenizer instance
-        max_text_len=data_args.max_text_len,
-        require_both_sequences=data_args.require_both_sequences
+        max_text_len=data_args.max_text_len
     )
     print(f"[DEBUG] Training dataset initialized. Number of samples: {len(train_dataset)}")
     print(f"[TIME] Dataset initialization took {time.time() - t0:.2f} seconds.")
@@ -232,6 +255,13 @@ def main():
     )
     print("[DEBUG] Hugging Face Trainer initialized.")
     print(f"[TIME] Trainer initialization took {time.time() - t1:.2f} seconds.")
+
+    print("\n=== DEBUG: Verifying Model State Before Training ===")
+    print("Trainable parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"  - {name}")
+    print("================================================\n")
 
     print(f"\n[DEBUG] Value of training_args.do_train before training block: {training_args.do_train}")
     if training_args.do_train:
@@ -293,5 +323,5 @@ def main():
 
 if __name__ == "__main__":
     # Set CUDA_VISIBLE_DEVICES to use both cuda:0 and cuda:1
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
     main()

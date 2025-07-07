@@ -99,7 +99,7 @@ def setup_model_and_tokenizer(config: InferenceConfig):
     model_args = {
         "model_name_or_path": config.model_name,
         "protein_encoder_name_or_path": config.protein_encoder_name,
-        "mm_use_resampler_gca": True,  # Enable for inference
+        "mm_resampler": True,  # Enable for inference
         "mm_gated_cross_attention": True,  # Enable for inference
         "mm_projector_type": "mlp2x_gelu",  # Enable for inference
         "num_media_tokens": 128,

@@ -1,10 +1,10 @@
 model_args:
   model_name_or_path: meta-llama/Meta-Llama-3.1-8B-Instruct
   protein_encoder_name_or_path: esm3_sm_open_v1
-  mm_use_resampler_gca: True
+  mm_resampler: True
   mm_gated_cross_attention: True # Explicitly enable GCA
   mm_projector_type: mlp2x_gelu
-  num_media_tokens: 128
+  num_media_tokens: 16
   mm_protein_select_layer: -2 # Feature from one of the later layers of ESM3
   tune_mm_mlp_adapter: True
   use_mm_proj: True
@@ -13,13 +13,16 @@ model_args:
   ff_mult: 4
   perceiver_depth: 6
   lora_enable: False # Disable LoRA for pretraining
-  
+  mm_gca_num_heads: 8
+  mm_resampler_num_heads: 8
+  resampler_output_dim: 1536
 
 data_args:
-  data_path: /data/macaulay/Mutation2Text/data/mut_text_data.json
-  require_both_sequences: True
-  # DELTA_TOKEN: "<delta_P>" # Defined in code, but useful to note here
-  # IGNORE_INDEX: -100 # Standard for labels to ignore
+  data_path: /data/macaulay/second/scratch/mutation2text/data/test.json
+  max_text_len: 1536
+
+
+
 
 training_args:
   output_dir: ./output/pretrain_gca
@@ -27,10 +30,10 @@ training_args:
   do_eval: False
   # Checkpoint will be auto-detected
   num_train_epochs: 1
-  per_device_train_batch_size: 32
+  per_device_train_batch_size: 8
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 1
-  evaluation_strategy: "steps"
+  evaluation_strategy: "no"
   eval_steps: 500
   save_strategy: "steps"
   save_steps: 1000
@@ -40,7 +43,7 @@ training_args:
   warmup_ratio: 0.03
   lr_scheduler_type: "cosine"
   logging_steps: 10
-  report_to: "tensorboard"
+  report_to: [tensorboard]
   mode: "train"
 
   # DeepSpeed and Precision

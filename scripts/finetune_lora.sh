@@ -23,7 +23,8 @@ mkdir -p $LORA_CONFIG_OUTPUT_DIR
 echo "Starting LoRA Finetuning..."
 echo "Output directory: $LORA_CONFIG_OUTPUT_DIR"
 
-$LAUNCHER --num_gpus=$NUM_GPUS $FINETUNE_SCRIPT \
+# $LAUNCHER --num_gpus=$NUM_GPUS $FINETUNE_SCRIPT \
+CUDA_VISIBLE_DEVICES=1 $LAUNCHER  --master_port 29500 $FINETUNE_SCRIPT \
     --output_dir $LORA_CONFIG_OUTPUT_DIR \
     --deepspeed $ZERO_STAGE_CONFIG \
     --model_config_file $LORA_CONFIG \

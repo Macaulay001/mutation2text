@@ -3,12 +3,14 @@ import torch.nn as nn
 import math
 from transformers import LlamaForCausalLM, LlamaConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
-import typing
+import typing 
 import time
 from torch.utils.checkpoint import checkpoint
 from einops import rearrange, repeat
 import einops
 import torch.nn.functional as F
+from llava.utils.data_utils import IGNORE_INDEX
+from typing import Optional, List, Union, Tuple
 
 def exists(val):
     return val is not None
@@ -32,22 +34,22 @@ class FeedForward(nn.Module):
         self.fc1.weight.data = self.fc1.weight.data.to(torch.float32)
         self.fc2.weight.data = self.fc2.weight.data.to(torch.float32)
         
-        print("[DEBUG FF Init] Parameter dtypes:")
-        print(f"  norm.weight: {self.norm.weight.dtype}")
-        print(f"  norm.bias: {self.norm.bias.dtype}")
-        print(f"  fc1.weight: {self.fc1.weight.dtype}")
-        print(f"  fc2.weight: {self.fc2.weight.dtype}")
+        # print("[DEBUG FF Init] Parameter dtypes:")
+        # print(f"  norm.weight: {self.norm.weight.dtype}")
+        # print(f"  norm.bias: {self.norm.bias.dtype}")
+        # print(f"  fc1.weight: {self.fc1.weight.dtype}")
+        # print(f"  fc2.weight: {self.fc2.weight.dtype}")
 
     def forward(self, x):
         orig_dtype = x.dtype
-        print("\n[DEBUG FF Forward] Input:")
-        print(f"  x: shape={x.shape}, dtype={x.dtype}")
-        print(f"  fc1.weight: {self.fc1.weight.dtype}")
-        print(f"  fc2.weight: {self.fc2.weight.dtype}")
+        # print("\n[DEBUG FF Forward] Input:")
+        # print(f"  x: shape={x.shape}, dtype={x.dtype}")
+        # print(f"  fc1.weight: {self.fc1.weight.dtype}")
+        # print(f"  fc2.weight: {self.fc2.weight.dtype}")
         
         # Ensure LayerNorm parameters are float32 and apply LayerNorm in float32
         x_f32 = x.to(torch.float32)
-        print(f"[DEBUG FF Forward] x_f32 dtype before norm: {x_f32.dtype}")
+        # print(f"[DEBUG FF Forward] x_f32 dtype before norm: {x_f32.dtype}")
         x = F.layer_norm(
             x_f32,
             self.norm.normalized_shape,
@@ -55,28 +57,24 @@ class FeedForward(nn.Module):
             self.norm.bias.to(torch.float32),
             self.norm.eps
         )
-        print(f"[DEBUG FF Forward] x dtype after norm: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after norm: {x.dtype}")
         
         # Convert back to original dtype for the rest of processing
         x = x.to(orig_dtype)
-        print(f"[DEBUG FF Forward] x dtype after converting back: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after converting back: {x.dtype}")
         
         # Match input dtype to weight dtype for linear layers
         x = self.fc1(x.to(self.fc1.weight.dtype))
-        print(f"[DEBUG FF Forward] x dtype after fc1: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after fc1: {x.dtype}")
         
         x = self.act(x)  # GELU preserves dtype
-        print(f"[DEBUG FF Forward] x dtype after activation: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after activation: {x.dtype}")
         
         x = self.fc2(x.to(self.fc2.weight.dtype))
-        print(f"[DEBUG FF Forward] x dtype after fc2: {x.dtype}")
+        # print(f"[DEBUG FF Forward] x dtype after fc2: {x.dtype}")
         return x
 
-# from .esm_protein_encoder import ESMProteinEncoder # Assuming this will be in the same directory
 
-# Placeholder for DELTA_TOKEN and IGNORE_INDEX, usually defined in training scripts or data utils
-# DELTA_TOKEN_ID_PLACEHOLDER = -1  # This should be dynamically set from tokenizer
-IGNORE_INDEX = -100
 
 class GatedCrossAttention(nn.Module):
     def __init__(self, query_dim, key_value_dim, output_dim, num_heads=8, dim_head=64, ff_mult=4):
@@ -91,9 +89,9 @@ class GatedCrossAttention(nn.Module):
         self.to_q_cross = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_kv_cross = nn.Linear(key_value_dim, inner_dim * 2, bias=False)
         
-        # Components for self attention (mut -> mut)
-        self.to_qkv_self = nn.Linear(query_dim, inner_dim * 3, bias=False)
-        
+        # Shared self-attention for both wild-type and mutation features
+        self.to_qkv_self_attn = nn.Linear(query_dim, inner_dim * 3, bias=False)
+
         # Attention-based gating mechanism
         self.gate_norm = nn.LayerNorm(inner_dim)
         self.gate_attention = nn.MultiheadAttention(
@@ -116,95 +114,84 @@ class GatedCrossAttention(nn.Module):
         self.ff = FeedForward(dim=output_dim, mult=ff_mult)
         self.ff_gate = nn.Parameter(torch.ones(1))
 
-    def forward(self, query_feats, kv_feats_wt, kv_feats_mut):
-        print(f"\n[DEBUG GCA Forward] Initial dtypes:")
-        print(f"  query_feats: {query_feats.dtype}")
-        print(f"  kv_feats_wt: {kv_feats_wt.dtype}")
-        print(f"  kv_feats_mut: {kv_feats_mut.dtype}")
-        print(f"  to_q_cross.weight: {self.to_q_cross.weight.dtype}")
-        print(f"  to_kv_cross.weight: {self.to_kv_cross.weight.dtype}")
-
-        # Convert inputs to bfloat16 to match the model's parameters
-        query_feats = query_feats.to(torch.bfloat16)
+    def forward(self, query_feats, kv_feats_wt, mode):
+        # Handle different modes of operation for GCA
+        scale = self.head_dim ** -0.5
+        
         kv_feats_wt = kv_feats_wt.to(torch.bfloat16)
-        if kv_feats_mut is not None:
-            kv_feats_mut = kv_feats_mut.to(torch.bfloat16)
+        kv_feats_wt_norm = self.norm_key_value(kv_feats_wt)
 
-        # Layer normalization
-        query_feats_norm = self.norm_query(query_feats)  # mutation features
-        kv_feats_wt_norm = self.norm_key_value(kv_feats_wt)  # wild-type features
+        # Always compute wild-type self-attention for modes that use it
+        wt_out = None
+        if mode in ['full', 'wt_only']:
+            qkv_wt = self.to_qkv_self_attn(kv_feats_wt_norm)
+            q_wt, k_wt_self, v_wt_self = qkv_wt.chunk(3, dim=-1)
+            
+            q_wt = rearrange(q_wt, 'b n (h d) -> b h n d', h=self.num_heads)
+            k_wt_self = rearrange(k_wt_self, 'b n (h d) -> b h n d', h=self.num_heads)
+            v_wt_self = rearrange(v_wt_self, 'b n (h d) -> b h n d', h=self.num_heads)
+            
+            sim_wt_self = torch.einsum('b h i d, b h j d -> b h i j', q_wt * scale, k_wt_self)
+            attn_wt_self = F.softmax(sim_wt_self, dim=-1)
+            wt_out = torch.einsum('b h i j, b h j d -> b h i d', attn_wt_self, v_wt_self)
+            wt_out = rearrange(wt_out, 'b h n d -> b n (h d)')
+            wt_out = self.to_out(wt_out)
+
+        if mode == 'wt_only':
+            return None, wt_out
+
+        # For 'full' and 'delta_only', mutation features are required
+        if query_feats is None:
+            raise ValueError("query_feats cannot be None for 'full' or 'delta_only' modes.")
         
-        # 1. Cross Attention (mutation query -> wild-type k/v)
+        query_feats = query_feats.to(torch.bfloat16)
+        query_feats_norm = self.norm_query(query_feats)
+        
+        # Cross Attention (mut -> wt)
         q_cross = self.to_q_cross(query_feats_norm)
-        k_wt, v_wt = self.to_kv_cross(kv_feats_wt_norm).chunk(2, dim=-1)
+        # Ensure we use the kv_feats_wt that corresponds to the query_feats batch
+        k_cross, v_cross = self.to_kv_cross(kv_feats_wt_norm).chunk(2, dim=-1)
         
-        # Split heads for cross attention
         q_cross = rearrange(q_cross, 'b n (h d) -> b h n d', h=self.num_heads)
-        k_wt = rearrange(k_wt, 'b n (h d) -> b h n d', h=self.num_heads)
-        v_wt = rearrange(v_wt, 'b n (h d) -> b h n d', h=self.num_heads)
+        k_cross = rearrange(k_cross, 'b n (h d) -> b h n d', h=self.num_heads)
+        v_cross = rearrange(v_cross, 'b n (h d) -> b h n d', h=self.num_heads)
         
-        # Cross attention computation
-        scale = q_cross.shape[-1] ** -0.5
-        sim_wt = torch.einsum('b h i d, b h j d -> b h i j', q_cross * scale, k_wt)
-        attn_wt = F.softmax(sim_wt, dim=-1)
-        cross_out = torch.einsum('b h i j, b h j d -> b h i d', attn_wt, v_wt)
+        sim_cross = torch.einsum('b h i d, b h j d -> b h i j', q_cross * scale, k_cross)
+        attn_cross = F.softmax(sim_cross, dim=-1)
+        cross_out = torch.einsum('b h i j, b h j d -> b h i d', attn_cross, v_cross)
         cross_out = rearrange(cross_out, 'b h n d -> b n (h d)')
 
-        if kv_feats_mut is not None:
-            # 2. Self Attention (mutation -> mutation)
-            qkv_self = self.to_qkv_self(query_feats_norm)
-            q_self, k_self, v_self = qkv_self.chunk(3, dim=-1)
-            
-            # Split heads for self attention
-            q_self = rearrange(q_self, 'b n (h d) -> b h n d', h=self.num_heads)
-            k_self = rearrange(k_self, 'b n (h d) -> b h n d', h=self.num_heads)
-            v_self = rearrange(v_self, 'b n (h d) -> b h n d', h=self.num_heads)
-            
-            # Self attention computation
-            sim_self = torch.einsum('b h i d, b h j d -> b h i j', q_self * scale, k_self)
-            attn_self = F.softmax(sim_self, dim=-1)
-            self_out = torch.einsum('b h i j, b h j d -> b h i d', attn_self, v_self)
-            self_out = rearrange(self_out, 'b h n d -> b n (h d)')
-            
-            # Apply attention-based gating
-            # 1. Normalize both attention outputs
-            self_out_norm = self.gate_norm(self_out)
-            cross_out_norm = self.gate_norm(cross_out)
-            
-            # 2. Use attention mechanism to compute interaction between self and cross attention
-            gate_context, _ = self.gate_attention(
-                query=self_out_norm,
-                key=cross_out_norm,
-                value=cross_out_norm
-            )
-            
-            # 3. Generate dynamic mixing weights based on the attention context
-            batch_size, seq_len, _ = gate_context.shape
-            mixing_weights = self.to_mixing_weights(gate_context)  # [batch, seq_len, 2]
-            
-            # 4. Mix self and cross attention outputs using learned weights
-            mixed_output = (
-                mixing_weights[..., 0:1] * self_out +
-                mixing_weights[..., 1:2] * cross_out
-            )
-            
-            # Project to output dimension
-            delta = self.to_out(mixed_output)
-            
-            # Apply feedforward
-            if hasattr(self, 'ff'):
-                ff_out = self.ff(delta)
-                delta = delta + self.ff_gate * ff_out
-            
-            return delta
-        else:
-            # If no mutation features, just return processed cross-attention features
-            out = self.to_out(cross_out)
-            if hasattr(self, 'ff'):
-                ff_out = self.ff(out)
-                out = out + self.ff_gate * ff_out
-            return out
+        # Self Attention (mut -> mut)
+        qkv_self = self.to_qkv_self_attn(query_feats_norm)
+        q_self, k_self, v_self = qkv_self.chunk(3, dim=-1)
         
+        q_self = rearrange(q_self, 'b n (h d) -> b h n d', h=self.num_heads)
+        k_self = rearrange(k_self, 'b n (h d) -> b h n d', h=self.num_heads)
+        v_self = rearrange(v_self, 'b n (h d) -> b h n d', h=self.num_heads)
+        
+        sim_self = torch.einsum('b h i d, b h j d -> b h i j', q_self * scale, k_self)
+        attn_self = F.softmax(sim_self, dim=-1)
+        self_out = torch.einsum('b h i j, b h j d -> b h i d', attn_self, v_self)
+        self_out = rearrange(self_out, 'b h n d -> b n (h d)')
+
+        # Gating
+        self_out_norm = self.gate_norm(self_out)
+        cross_out_norm = self.gate_norm(cross_out)
+        gate_context, _ = self.gate_attention(query=self_out_norm, key=cross_out_norm, value=cross_out_norm)
+        mixing_weights = self.to_mixing_weights(gate_context)
+        
+        mixed_output = (
+            mixing_weights[..., 0:1] * self_out +
+            mixing_weights[..., 1:2] * cross_out
+        )
+        
+        delta = self.to_out(mixed_output)
+        
+        if hasattr(self, 'ff'):
+            ff_out = self.ff(delta)
+            delta = delta + self.ff_gate * ff_out
+        
+        return delta, wt_out
 
 class PerceiverResampler(nn.Module):
     def __init__(self, input_dim, output_dim, num_latents, num_output_tokens, num_layers=2, 
@@ -217,13 +204,13 @@ class PerceiverResampler(nn.Module):
         self.output_dim = output_dim
         inner_dim = dim_head * num_heads
         
-        print(f"[DEBUG Resampler Init] Configuration:")
-        print(f"  input_dim: {input_dim}")
-        print(f"  output_dim: {output_dim}")
-        print(f"  num_heads: {num_heads}")
-        print(f"  dim_head: {dim_head}")
-        print(f"  inner_dim: {inner_dim}")
-        print(f"  num_output_tokens: {num_output_tokens}")
+        # print(f"[DEBUG Resampler Init] Configuration:")
+        # print(f"  input_dim: {input_dim}")
+        # print(f"  output_dim: {output_dim}")
+        # print(f"  num_heads: {num_heads}")
+        # print(f"  dim_head: {dim_head}")
+        # print(f"  inner_dim: {inner_dim}")
+        # print(f"  num_output_tokens: {num_output_tokens}")
         
         # Learnable latent vectors that will be queried against the input sequence
         self.latents = nn.Parameter(torch.randn(num_output_tokens, input_dim))
@@ -350,20 +337,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
         print("[DEBUG] Initializing LlavaLlamaForCausalLM with protein_config:", self.protein_config)
 
         if self.protein_config is not None:
-            # Ensure required parameters are present with defaults
-            required_params = {
-                "esm_hidden_size": 1280,
-                "gca_output_dim": 512,
-                "resampler_output_dim": 4096,  # Same as LLM hidden size
-                "num_media_tokens": 128,
-                "mm_gca_num_heads": 8,
-                "mm_resampler_num_heads": 8
-            }
-            
-            for param, default in required_params.items():
-                if param not in self.protein_config:
-                    print(f"[WARNING] {param} not found in protein_config. Using default: {default}")
-                    self.protein_config[param] = default
 
             # Initialize GCA
             if self.protein_config.get("mm_gated_cross_attention", False):
@@ -382,7 +355,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
                 print("[DEBUG] GCA module initialized successfully")
 
             # Initialize Resampler
-            if self.protein_config.get("mm_use_resampler_gca", False):
+            if self.protein_config.get("mm_resampler", False):
                 print("[DEBUG] Initializing Resampler module with parameters:")
                 print(f"  gca_output_dim: {self.protein_config['gca_output_dim']}")
                 print(f"  resampler_output_dim: {self.protein_config['resampler_output_dim']}")
@@ -439,251 +412,511 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
             )
             assert has_trainable_module, "No trainable modules were initialized"
         
-        # Special token for delta_P, should be part of tokenizer
-        self.delta_token_id = None # Will be set from tokenizer
+        # # Special token for delta_P, should be part of tokenizer
+        # self.delta_token_id = None # Will be set from tokenizer
+        # self.wildtype_protein_token_id = None # Will be set from tokenizer
 
     def set_protein_encoder(self, protein_encoder):
         """Allows injecting the protein encoder after initialization."""
         self.protein_encoder = protein_encoder
 
-    def set_delta_token_id(self, token_id):
-        """Set the delta token ID and initialize its embeddings."""
-        self.delta_token_id = token_id
-        
-        # Initialize embeddings for the delta token
-        if token_id is not None:
-            # Get the embedding layer
-            embed_layer = self.get_input_embeddings()
-            hidden_size = embed_layer.weight.shape[1]
-            
-            # Initialize the embedding for the delta token with xavier uniform
-            if token_id < embed_layer.weight.shape[0]:
-                nn.init.xavier_uniform_(embed_layer.weight.data[token_id].view(1, hidden_size))
-                print(f"[DEBUG] Initialized embedding for delta token ID {token_id}")
-            else:
-                print(f"[WARNING] Delta token ID {token_id} is out of bounds for embedding layer")
-
     def get_protein_encoder(self):
         return self.protein_encoder # For external access if needed, e.g. freezing/unfreezing
 
-    def apply_GCA_resampler(self, wild_type_seqs_list, mutation_seqs_list):
+
+    def set_wt_protein_start_token_id(self, token_id):
+        self.wt_protein_start_token_id = token_id
+
+        # Initialize embeddings for the wt protein start token
+        if token_id is not None:
+            embed_layer = self.get_input_embeddings()
+            hidden_size = embed_layer.weight.shape[1]
+            if token_id < embed_layer.weight.shape[0]:
+                nn.init.xavier_uniform_(embed_layer.weight.data[token_id].view(1, hidden_size))
+                print(f"[DEBUG] Initialized embedding for wt protein start token ID {token_id}")
+            else:
+                print(f"[WARNING] WT protein start token ID {token_id} is out of bounds for embedding layer")
+
+    def set_wt_protein_end_token_id(self, token_id):
+        self.wt_protein_end_token_id = token_id
+
+        # Initialize embeddings for the wt protein end token
+        if token_id is not None:
+            embed_layer = self.get_input_embeddings()
+            hidden_size = embed_layer.weight.shape[1]
+            if token_id < embed_layer.weight.shape[0]:
+                nn.init.xavier_uniform_(embed_layer.weight.data[token_id].view(1, hidden_size))
+                print(f"[DEBUG] Initialized embedding for wt protein end token ID {token_id}")
+            else:
+                print(f"[WARNING] WT protein end token ID {token_id} is out of bounds for embedding layer")
+
+    def set_mut_protein_start_token_id(self, token_id): 
+        self.mut_protein_start_token_id = token_id
+
+        # Initialize embeddings for the mut protein start token
+        if token_id is not None:
+            embed_layer = self.get_input_embeddings()
+            hidden_size = embed_layer.weight.shape[1]
+            if token_id < embed_layer.weight.shape[0]:
+                nn.init.xavier_uniform_(embed_layer.weight.data[token_id].view(1, hidden_size))
+                print(f"[DEBUG] Initialized embedding for mut protein start token ID {token_id}")
+            else:   
+                print(f"[WARNING] Mut protein start token ID {token_id} is out of bounds for embedding layer")
+
+    def set_mut_protein_end_token_id(self, token_id):
+        self.mut_protein_end_token_id = token_id
+
+        # Initialize embeddings for the mut protein end token
+        if token_id is not None:
+            embed_layer = self.get_input_embeddings()
+            hidden_size = embed_layer.weight.shape[1]
+            if token_id < embed_layer.weight.shape[0]:
+                nn.init.xavier_uniform_(embed_layer.weight.data[token_id].view(1, hidden_size))
+                print(f"[DEBUG] Initialized embedding for mut protein end token ID {token_id}")
+            else:
+                print(f"[WARNING] Mut protein end token ID {token_id} is out of bounds for embedding layer")
+
+
+
+    def apply_GCA_resampler(self, wild_type_seqs_list, mutation_seqs_list, mode):
         """
-        Processes protein sequences through ESM, GCA, and Resampler.
-        wild_type_seqs_list: List of WT AA strings.
-        mutation_seqs_list: List of Mutated AA strings.
+        Processes protein sequences through ESM, GCA, and Resampler based on the mode.
         """
         if self.protein_encoder is None:
             raise ValueError("Protein encoder is not initialized.")
-        if self.mm_gated_cross_attention is None or self.mm_resampler is None:
-            raise ValueError("GCA or Resampler is not configured.")
+        if self.mm_gated_cross_attention is None or self.mm_resampler is None or self.mm_projector is None:
+            raise ValueError("GCA, Resampler, or Projector is not configured.")
 
-        # 1a. Protein Encoding (ESM)
-        # Output: list of tensors (protein_sequence_length, esm_hidden_dimension)
-        # The ESMProteinEncoder should handle batching and return padded tensors directly
-        # Or return list of tensors that we pad here. Let's assume it returns padded tensors.
-        
-        # Get select layer from config
-        select_layer = self.protein_config.get("mm_protein_select_layer", -1)
-        
-        # (batch_size, max_wt_protein_len, esm_hidden_dim)
-        wt_protein_features = self.protein_encoder(wild_type_seqs_list, select_layer=select_layer)
-        # (batch_size, max_mut_protein_len, esm_hidden_dim)
-        mut_protein_features = self.protein_encoder(mutation_seqs_list, select_layer=select_layer)
+        # Encode wild-type sequences if needed
+        wt_feats = None
+        if mode in ['full', 'wt_only', 'delta_only']:
+            if wild_type_seqs_list is None or not all(wild_type_seqs_list):
+                 raise ValueError("Wild-type sequences must be provided for 'full', 'wt_only', or 'delta_only' mode.")
+            wt_feats = self.protein_encoder(wild_type_seqs_list)
+            print("\n[DEBUG] ESM Encoder Output (Wild-Type):")
+            print(f"  - Shape: {wt_feats.shape}")
+            print(f"  - Dtype: {wt_feats.dtype}")
+            print(f"  - Contains NaN: {torch.isnan(wt_feats).any().item()}")
+            print(f"  - Contains Inf: {torch.isinf(wt_feats).any().item()}")
+            print(f"  - Max value: {wt_feats.max().item():.4f}")
+            print(f"  - Min value: {wt_feats.min().item():.4f}")
+            print(f"  - Mean value: {wt_feats.mean().item():.4f}")
 
-        # 1b. Padding (Handled by ESMProteinEncoder or here if it returns lists of tensors)
-        max_len = max(wt_protein_features.shape[1], mut_protein_features.shape[1])
-        def pad_tensor(tensor, target_len):
-            padding_size = target_len - tensor.shape[1]
-            if padding_size > 0:
-                return nn.functional.pad(tensor, (0,0,0,padding_size))
-            return tensor
-        wt_protein_features_padded = pad_tensor(wt_protein_features, max_len)
-        mut_protein_features_padded = pad_tensor(mut_protein_features, max_len)
+        # Encode mutation sequences if needed
+        mut_feats = None
+        if mode in ['full', 'delta_only']:
+            if mutation_seqs_list is None or not all(mutation_seqs_list):
+                 raise ValueError("Mutation sequences must be provided for 'full' or 'delta_only' mode.")
+            mut_feats = self.protein_encoder(mutation_seqs_list)
+            print("\n[DEBUG] ESM Encoder Output (Mutation):")
+            print(f"  - Shape: {mut_feats.shape}")
+            print(f"  - Dtype: {mut_feats.dtype}")
+            print(f"  - Contains NaN: {torch.isnan(mut_feats).any().item()}")
+            print(f"  - Contains Inf: {torch.isinf(mut_feats).any().item()}")
+            print(f"  - Max value: {mut_feats.max().item():.4f}")
+            print(f"  - Min value: {mut_feats.min().item():.4f}")
+            print(f"  - Mean value: {mut_feats.mean().item():.4f}")
 
-        # Timing: before GCA
-        before_gca_time = time.time()
-        print(f"[TIME] >>> Before GCA: {before_gca_time}")
-        print(f"[DEBUG] Before GCA:")
-        print(f"  wt_features: shape={wt_protein_features_padded.shape}, dtype={wt_protein_features_padded.dtype}")
-        print(f"  mut_features: shape={mut_protein_features_padded.shape}, dtype={mut_protein_features_padded.dtype}")
+        # Pad features to the same length if both are present
+        if wt_feats is not None and mut_feats is not None:
+            max_len = max(wt_feats.shape[1], mut_feats.shape[1])
+            def pad_tensor(tensor, target_len):
+                padding_size = target_len - tensor.shape[1]
+                if padding_size > 0:
+                    return F.pad(tensor, (0, 0, 0, padding_size))
+                return tensor
+            wt_feats = pad_tensor(wt_feats, max_len)
+            mut_feats = pad_tensor(mut_feats, max_len)
 
-        # 1c. Gated Cross-Attention
-        gca_start = time.time()
-        delta_features = self.mm_gated_cross_attention(
-            query_feats=mut_protein_features_padded,
-            kv_feats_wt=wt_protein_features_padded,
-            kv_feats_mut=mut_protein_features_padded
+        # Gated Cross-Attention
+        delta_from_gca, wt_out_from_gca = self.mm_gated_cross_attention(
+            query_feats=mut_feats, 
+            kv_feats_wt=wt_feats,
+            mode=mode
         )
-        gca_end = time.time()
-        print(f"[TIME] <<< After GCA: {gca_end} (Duration: {gca_end - gca_start:.3f} sec)")
-        print(f"[DEBUG] After GCA:")
-        print(f"  delta_features: shape={delta_features.shape}, dtype={delta_features.dtype}")
 
-        # 1d. Resampler
-        resampler_start = time.time()
-        resampled_features = self.mm_resampler(delta_features)
-        resampler_end = time.time()
-        print(f"[TIME] Resampler duration: {resampler_end - resampler_start:.3f} sec")
+        # Resample features
+        protein_features = None
+        protein_features_wt = None
+        if self.mm_resampler is not None:
+            if delta_from_gca is not None:
+                protein_features = self.mm_resampler(delta_from_gca)
+            if wt_out_from_gca is not None:
+                protein_features_wt = self.mm_resampler(wt_out_from_gca)
         
-        # Timing: after resampler, before next GCA (if in a loop)
-        after_resampler_time = time.time()
-        print(f"[TIME] >>> After Resampler, before next GCA: {after_resampler_time}")
-        
-        return resampled_features
+        return protein_features, protein_features_wt
 
     def prepare_inputs_labels_for_multimodal(
-            self, input_ids, attention_mask, labels, protein_features
+        self, input_ids, attention_mask, labels, delta_features, wt_features
     ):
-        """
-        Merges protein features with text embeddings.
-        protein_features: (batch_size, num_media_tokens, llm_hidden_dim) - after projector
-        """
-        if protein_features is None or self.delta_token_id is None:
-            return input_ids, attention_mask, labels, None # No protein features to merge
-        print(f"[DEBUG] prepare_inputs_labels_for_multimodal: input_ids shape: {input_ids.shape}, protein_features shape: {protein_features.shape}")
-        
-        batch_size, num_protein_tokens, llm_hidden_dim = protein_features.shape
-        
-        # Get LLM's token embeddings
-        token_embeddings = self.get_input_embeddings()(input_ids) # (batch_size, text_seq_len, llm_hidden_dim)
+        if delta_features is None and wt_features is None:
+            return input_ids, None, attention_mask, labels
 
-        new_input_embeds = []
-        new_labels = [] if labels is not None else None
-        new_attention_mask = []
+        print("\n=== prepare_inputs_labels_for_multimodal Debug ===")
+        print("Input shapes:")
+        print(f"  input_ids: {input_ids.shape}")
+        print(f"  attention_mask: {attention_mask.shape}")
+        if labels is not None:
+            print(f"  labels: {labels.shape}")
+        if delta_features is not None:
+            print(f"  delta_features: {delta_features.shape}")
+        else:
+            print(f"  delta_features: None")
+        if wt_features is not None:
+            print(f"  wt_features: {wt_features.shape}")
+        else:
+            print(f"  wt_features: None")
+
+        token_embeddings = self.get_input_embeddings()(input_ids)
+        new_input_embeds, new_labels, new_attention_mask = [], [], []
+        batch_size = input_ids.shape[0]
+
+        print("\nSpecial token counts in input_ids:")
+        delta_tokens = (input_ids == self.mut_protein_start_token_id).sum()
+        wt_tokens = (input_ids == self.wt_protein_start_token_id).sum()
+        print(f"  Delta tokens: {delta_tokens}")
+        print(f"  Wildtype tokens: {wt_tokens}")
+
+        print(f"\nToken embeddings shape: {token_embeddings.shape}")
+        print(f"Batch size: {batch_size}, Hidden dim: {token_embeddings.shape[-1]}")
 
         for i in range(batch_size):
-            # Find the position of DELTA_TOKEN_INDEX
-            delta_token_indices = (input_ids[i] == self.delta_token_id).nonzero(as_tuple=True)[0]
+            print(f"\nProcessing batch item {i}:")
+            # Find all special token indices for the current sample
+            wt_start_idx = (input_ids[i] == self.wt_protein_start_token_id).nonzero(as_tuple=True)[0]
+            wt_end_idx = (input_ids[i] == self.wt_protein_end_token_id).nonzero(as_tuple=True)[0]
+            mut_start_idx = (input_ids[i] == self.mut_protein_start_token_id).nonzero(as_tuple=True)[0]
+            mut_end_idx = (input_ids[i] == self.mut_protein_end_token_id).nonzero(as_tuple=True)[0]
             
-            if len(delta_token_indices) == 0:
-                print(f"Warning: DELTA_TOKEN_ID {self.delta_token_id} not found in input_ids sample {i}. Protein features not inserted.")
-                new_input_embeds.append(token_embeddings[i])
-                if labels is not None: new_labels.append(labels[i])
-                new_attention_mask.append(attention_mask[i])
-                continue
+            print(f"  Found wildtype tokens at: {wt_start_idx.tolist()}")
+            print(f"  Found delta tokens at: {mut_start_idx.tolist()}")
 
-            delta_token_idx = delta_token_indices[0] # Use the first occurrence
+            # Create a list of parts to assemble
+            embed_parts, label_parts, mask_parts = [], [], []
+            last_idx = 0
 
-            # Get protein features for this sample - maintain 2D shape
-            current_protein_features = protein_features[i]  # Shape: [num_protein_tokens, llm_hidden_dim]
-
-            # Split text embeddings around the delta token
-            pre_delta_embeds = token_embeddings[i, :delta_token_idx]
-            post_delta_embeds = token_embeddings[i, delta_token_idx + 1:]
+            # Determine insertion order based on token positions
+            insertions = []
+            # Only plan to insert if BOTH start/end tokens are present AND the corresponding features were passed in.
+            if len(wt_start_idx) > 0 and len(wt_end_idx) > 0 and wt_features is not None:
+                insertions.append({'type': 'wt', 'start': wt_start_idx[0], 'end': wt_end_idx[0]})
+            if len(mut_start_idx) > 0 and len(mut_end_idx) > 0 and delta_features is not None:
+                insertions.append({'type': 'mut', 'start': mut_start_idx[0], 'end': mut_end_idx[0]})
             
-            print(f"[DEBUG] pre_delta_embeds shape: {pre_delta_embeds.shape}, post_delta_embeds shape: {post_delta_embeds.shape}, current_protein_features shape: {current_protein_features.shape}")
-            
-            # Concatenate: text_before | protein_features | text_after
-            merged_embeds = torch.cat([pre_delta_embeds, current_protein_features, post_delta_embeds], dim=0)
+            insertions.sort(key=lambda x: x['start'])
+
+            for insert in insertions:
+                start_idx, end_idx = insert['start'], insert['end']
+                
+                # Part 1: Text from last stop to this start
+                embed_parts.append(token_embeddings[i, last_idx : start_idx + 1])
+                label_parts.append(labels[i, last_idx : start_idx + 1])
+                mask_parts.append(attention_mask[i, last_idx : start_idx + 1])
+                
+                # Part 2: Inserted features, guaranteed to exist by the check above
+                if insert['type'] == 'wt':
+                    features = wt_features[i]
+                    num_feat_tokens = wt_features.shape[1]
+                    if delta_features is None: # wt_only mode for this sample
+                        print(f"  Processing wt_only mode")
+                        print(f"  Merging wildtype features at index {start_idx.item()}")
+                        print(f"  Number of wildtype tokens: {num_feat_tokens}")
+                else: # 'mut'
+                    features = delta_features[i]
+                    num_feat_tokens = delta_features.shape[1]
+                    print(f"  Processing delta or full mode")
+                    print(f"  Delta token index: {start_idx.item()}")
+                    print(f"  Number of protein tokens: {num_feat_tokens}")
+
+                
+                embed_parts.append(features)
+                label_parts.append(torch.full((num_feat_tokens,), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
+                mask_parts.append(torch.ones(num_feat_tokens, device=attention_mask.device, dtype=attention_mask.dtype))
+
+                last_idx = end_idx
+
+            # Part 3: Remaining text
+            embed_parts.append(token_embeddings[i, last_idx:])
+            label_parts.append(labels[i, last_idx:])
+            mask_parts.append(attention_mask[i, last_idx:])
+
+            # Assemble the final sequence
+            merged_embeds = torch.cat(embed_parts, dim=0)
+            if insertions and delta_features is None and any(d['type'] == 'wt' for d in insertions):
+                 print(f"  Merged embeddings shape: {merged_embeds.shape}")
+
             new_input_embeds.append(merged_embeds)
-
-            if labels is not None:
-                pre_delta_labels = labels[i, :delta_token_idx]
-                # Protein feature labels: IGNORE_INDEX
-                protein_labels = torch.full((num_protein_tokens,), IGNORE_INDEX, 
-                                            device=labels.device, dtype=labels.dtype)
-                post_delta_labels = labels[i, delta_token_idx + 1:]
-                merged_labels = torch.cat([pre_delta_labels, protein_labels, post_delta_labels], dim=0)
-                new_labels.append(merged_labels)
+            new_labels.append(torch.cat(label_parts, dim=0))
+            new_attention_mask.append(torch.cat(mask_parts, dim=0))
             
-            # Update attention mask
-            pre_delta_mask = attention_mask[i, :delta_token_idx]
-            protein_mask = torch.ones(num_protein_tokens, device=attention_mask.device, dtype=attention_mask.dtype)
-            post_delta_mask = attention_mask[i, delta_token_idx + 1:]
-            merged_mask = torch.cat([pre_delta_mask, protein_mask, post_delta_mask], dim=0)
-            new_attention_mask.append(merged_mask)
-
-        # Pad sequences to max length in batch
-        max_len = max(embed.shape[0] for embed in new_input_embeds)
+        # Pad the entire batch to the same length
+        max_len = max(len(embed) for embed in new_input_embeds)
+        print(f"\nPadding all sequences to max length: {max_len}")
         
-        padded_input_embeds = torch.zeros(batch_size, max_len, llm_hidden_dim, device=token_embeddings.device, dtype=token_embeddings.dtype)
-        padded_attention_mask = torch.zeros(batch_size, max_len, device=attention_mask.device, dtype=attention_mask.dtype)
-        if labels is not None:
-            padded_labels = torch.full((batch_size, max_len), IGNORE_INDEX, device=labels.device, dtype=labels.dtype)
-        else:
-            padded_labels = None
+        final_embeds = torch.zeros(batch_size, max_len, token_embeddings.shape[-1], dtype=token_embeddings.dtype, device=token_embeddings.device)
+        final_labels = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=labels.dtype, device=labels.device)
+        final_mask = torch.zeros(batch_size, max_len, dtype=attention_mask.dtype, device=attention_mask.device)
 
         for i in range(batch_size):
             seq_len = new_input_embeds[i].shape[0]
-            padded_input_embeds[i, :seq_len] = new_input_embeds[i]
-            padded_attention_mask[i, :seq_len] = new_attention_mask[i]
-            if labels is not None and new_labels is not None:
-                 padded_labels[i, :seq_len] = new_labels[i]
+            final_embeds[i, :seq_len] = new_input_embeds[i]
+            final_labels[i, :seq_len] = new_labels[i]
+            final_mask[i, :seq_len] = new_attention_mask[i]
         
-        return None, padded_input_embeds, padded_attention_mask, padded_labels
+        print("\nFinal output shapes:")
+        print(f"  input_embeds: {final_embeds.shape}")
+        print(f"  attention_mask: {final_mask.shape}")
+        print(f"  labels: {final_labels.shape}")
+        print("=== End prepare_inputs_labels_for_multimodal Debug ===")
 
+        return None, final_embeds, final_mask, final_labels
 
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: typing.Optional[torch.Tensor] = None,
-        position_ids: typing.Optional[torch.LongTensor] = None, # Added position_ids
-        past_key_values: typing.Optional[typing.List[torch.FloatTensor]] = None,
-        inputs_embeds: typing.Optional[torch.FloatTensor] = None,
-        labels: typing.Optional[torch.LongTensor] = None,
-        use_cache: typing.Optional[bool] = None,
-        output_attentions: typing.Optional[bool] = None,
-        output_hidden_states: typing.Optional[bool] = None,
-        return_dict: typing.Optional[bool] = None,
-        # Custom arguments for protein sequences
-        wild_type_sequences: typing.Optional[typing.List[str]] = None,
-        mutation_sequences: typing.Optional[typing.List[str]] = None,
-    ) -> typing.Union[tuple, CausalLMOutputWithPast]:
-        fwd_start = time.time()
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        wild_type_sequences: Optional[List[str]] = None,
+        mutation_sequences: Optional[List[str]] = None,
+        attention_mode: Optional[List[str]] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        print("\n=== Forward Pass Debug ===")
+        print("Input shapes and types:")
+        print(f"  input_ids: {input_ids.shape if input_ids is not None else 'None'}")
+        print(f"  attention_mask: {attention_mask.shape if attention_mask is not None else 'None'}")
+        print(f"  position_ids: {position_ids.shape if position_ids is not None else 'None'}")
+        print(f"  inputs_embeds: {inputs_embeds.shape if inputs_embeds is not None else 'None'}")
+        print(f"  labels: {labels.shape if labels is not None else 'None'}")
 
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        print("\nSequence inputs:")
+        print(f"  wild_type_sequences: {len(wild_type_sequences) if wild_type_sequences is not None else 0}")
+        print(f"  mutation_sequences: {len(mutation_sequences) if mutation_sequences is not None else 0}")
+        print(f"  attention_mode: {attention_mode}")
 
-        protein_features_projected = None
-        if wild_type_sequences is not None and mutation_sequences is not None and self.protein_config is not None:
-            if self.protein_encoder is None:
-                 raise ValueError("Protein encoder not set. Call set_protein_encoder() or ensure it's loaded via config.")
-            if self.delta_token_id is None:
-                raise ValueError("Delta token ID not set. Call set_delta_token_id().")
+        has_protein_input = wild_type_sequences is not None or mutation_sequences is not None
+        print(f"\nHas protein input: {has_protein_input}")
 
 
-            # 1. Process protein sequences through GCA and Resampler
-            # Output: (batch_size, 1, num_media_tokens, resampler_output_dim)
-            protein_features_resampled = self.apply_GCA_resampler(
-                wild_type_seqs_list=wild_type_sequences,
-                mutation_seqs_list=mutation_sequences
-            )
+        if has_protein_input:
+            # Group samples by attention_mode
+            print("\nGrouping samples by attention_mode...")
+            grouped_indices = {'full': [], 'delta_only': [], 'wt_only': [], 'text_only': []}
+            for i, mode in enumerate(attention_mode):
+                grouped_indices[mode].append(i)
+
+            print("Grouped indices:")
+            print(f"  full: {len(grouped_indices['full'])} samples")
+            print(f"  delta_only: {len(grouped_indices['delta_only'])} samples")
+            print(f"  wt_only: {len(grouped_indices['wt_only'])} samples")
+            print(f"  text_only: {len(grouped_indices['text_only'])} samples")
+
+            final_embeds_parts = []
+            final_attention_mask_parts = []
+            final_labels_parts = []
+            original_indices_parts = []
+
+            # Process each group
+            for mode, indices in grouped_indices.items():
+                if not indices:
+                    continue
+                
+                print(f"\n[DEBUG] Processing {mode} group with {len(indices)} samples")
+                sub_batch_indices = torch.tensor(indices, device=self.device)
+                
+                # Common slicing for all modes
+                sub_input_ids = input_ids[sub_batch_indices]
+                sub_attention_mask = attention_mask[sub_batch_indices]
+                sub_labels = labels[sub_batch_indices] if labels is not None else None
+
+                print("  Sub-batch shapes:")
+                print(f"    input_ids: {sub_input_ids.shape}")
+                print(f"    attention_mask: {sub_attention_mask.shape}")
+                if sub_labels is not None:
+                    print(f"    labels: {sub_labels.shape}")
+
+                delta_features, wt_features = None, None
+
+                if mode in ['full', 'delta_only', 'wt_only']:
+                    sub_wt_seqs = [wild_type_sequences[i] for i in indices] if mode in ['full', 'wt_only', 'delta_only'] else None
+                    sub_mut_seqs = [mutation_sequences[i] for i in indices] if mode in ['full', 'delta_only'] else None
+                    
+                    print(f"\nProcessing {mode} group:")
+                    print(f"  Wild-type sequences: {len(sub_wt_seqs) if sub_wt_seqs is not None else 0}")
+                    print(f"  Mutation sequences: {len(sub_mut_seqs) if sub_mut_seqs is not None else 0}")
+
+                    delta_features, wt_features = self.apply_GCA_resampler(
+                        wild_type_seqs_list=sub_wt_seqs,
+                        mutation_seqs_list=sub_mut_seqs,
+                        mode=mode
+                    )
+                    
+                    print("  GCA+Resampler output shapes:")
+                    print(f"    delta_features: {delta_features.shape if delta_features is not None else 'None'}")
+                    print(f"    wt_features: {wt_features.shape if wt_features is not None else 'None'}")
+
+                    # Project features to the LLM's embedding space
+                    if delta_features is not None and hasattr(self, 'mm_projector'):
+                        projected_features = self.mm_projector(delta_features)
+                        print(f"\n[DEBUG] MLPProjector forward (delta):\n  Input shape: {delta_features.shape}, dtype: {delta_features.dtype}\n    After projection: {projected_features.shape}")
+                        delta_features = projected_features
+
+                    if wt_features is not None and hasattr(self, 'mm_projector'):
+                        projected_features_wt = self.mm_projector(wt_features)
+                        print(f"\n[DEBUG] MLPProjector forward (wt):\n  Input shape: {wt_features.shape}, dtype: {wt_features.dtype}\n    After projection (wt): {projected_features_wt.shape}")
+                        wt_features = projected_features_wt
+                
+                if mode == 'text_only':
+                    new_input_embeds = self.get_input_embeddings()(sub_input_ids)
+                    new_attention_mask = sub_attention_mask
+                    new_labels = sub_labels
+                else:
+                    # Step 3: Merge projected features with text embeddings
+                    _, new_input_embeds, new_attention_mask, new_labels = self.prepare_inputs_labels_for_multimodal(
+                        input_ids=sub_input_ids,
+                        attention_mask=sub_attention_mask,
+                        labels=sub_labels,
+                        delta_features=delta_features,
+                        wt_features=wt_features
+                    )
+                
+                final_embeds_parts.append(new_input_embeds)
+                final_attention_mask_parts.append(new_attention_mask)
+                if new_labels is not None:
+                    final_labels_parts.append(new_labels)
+                original_indices_parts.extend(indices)
+
+            print("\nCombining processed parts...")
             
-            # 2. Project features to LLM embedding space
-            # Input: (batch_size, 1, num_media_tokens, resampler_output_dim)
-            # Output: (batch_size, 1, num_media_tokens, llm_hidden_dim)
-            protein_features_projected = self.mm_projector(protein_features_resampled)
+            max_len = max(p.shape[1] for p in final_embeds_parts)
+            print(f"\nPadding details:")
+            print(f"  Max sequence length: {max_len}")
+            print(f"  Number of parts to process: {len(final_embeds_parts)}")
 
-        if inputs_embeds is None and protein_features_projected is not None:
-            # 3. Integrate with LLM Embeddings
-            input_ids, inputs_embeds, attention_mask, labels = self.prepare_inputs_labels_for_multimodal(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                protein_features=protein_features_projected
-            )
-            # After this, input_ids might be None if inputs_embeds is returned,
-            # or input_ids is effectively replaced by the process that generates inputs_embeds.
-            # The base LlamaForCausalLM preferentially uses inputs_embeds if provided.
+            padded_embeds_parts = []
+            padded_mask_parts = []
+            padded_labels_parts = []
 
-        # If protein features were processed, inputs_embeds is now populated (or modified)
-        # and input_ids might be None (as expected by underlying LlamaModel if embeds are given)
-        
-        # Call the parent LlamaForCausalLM forward method
-        outputs = super().forward(
-            input_ids=input_ids if inputs_embeds is None else None, # Pass input_ids only if embeds are not used
-            attention_mask=attention_mask,
-            position_ids=position_ids, # Added position_ids
+            for i, part in enumerate(final_embeds_parts):
+                print(f"\nPart shapes before padding:\n  Part {i}:")
+                print(f"    Embeddings: {part.shape}")
+                print(f"    Attention mask: {final_attention_mask_parts[i].shape}")
+                if final_labels_parts:
+                    print(f"    Labels: {final_labels_parts[i].shape}")
+
+                current_len = part.shape[1]
+                if current_len == max_len:
+                    print(f"\nPart {i} already at max length ({max_len})")
+                    padded_embeds_parts.append(part)
+                    padded_mask_parts.append(final_attention_mask_parts[i])
+                    if final_labels_parts:
+                        padded_labels_parts.append(final_labels_parts[i])
+                    continue
+                
+                padding_len = max_len - current_len
+                print(f"\nPadding part {i}:")
+                print(f"  Current length: {current_len}")
+                print(f"  Target length: {max_len}")
+                print(f"  Padding length: {padding_len}")
+                
+                print("  Original shapes:")
+                print(f"    Embeddings: {part.shape}")
+                print(f"    Attention mask: {final_attention_mask_parts[i].shape}")
+                if final_labels_parts:
+                    print(f"    Labels: {final_labels_parts[i].shape}")
+
+                pad_spec = (0, 0, 0, padding_len)
+                padded_embeds = F.pad(part, pad_spec, 'constant', 0)
+                padded_mask = F.pad(final_attention_mask_parts[i], (0, padding_len), 'constant', 0)
+                
+                padded_embeds_parts.append(padded_embeds)
+                padded_mask_parts.append(padded_mask)
+
+                if final_labels_parts:
+                    padded_labels = F.pad(final_labels_parts[i], (0, padding_len), 'constant', IGNORE_INDEX)
+                    padded_labels_parts.append(padded_labels)
+
+                print("  Padded shapes:")
+                print(f"    Embeddings: {padded_embeds.shape}")
+                print(f"    Attention mask: {padded_mask.shape}")
+                if final_labels_parts:
+                    print(f"    Labels: {padded_labels.shape}")
+
+
+            print("\nConcatenating padded parts:")
+            print("Shapes before concatenation:")
+            for i in range(len(padded_embeds_parts)):
+                print(f"  Part {i}:")
+                print(f"    Embeddings: {padded_embeds_parts[i].shape}, dtype: {padded_embeds_parts[i].dtype}, device: {padded_embeds_parts[i].device}")
+                print(f"    Attention mask: {padded_mask_parts[i].shape}, dtype: {padded_mask_parts[i].dtype}, device: {padded_mask_parts[i].device}")
+                if padded_labels_parts:
+                    print(f"    Labels: {padded_labels_parts[i].shape}")
+
+
+            final_inputs_embeds = torch.cat(padded_embeds_parts, dim=0)
+            final_attention_mask = torch.cat(padded_mask_parts, dim=0)
+            final_labels = torch.cat(padded_labels_parts, dim=0) if padded_labels_parts else None
+
+            print("\nShapes after concatenation:")
+            print(f"  Inputs embeds: {final_inputs_embeds.shape}, dtype: {final_inputs_embeds.dtype}, device: {final_inputs_embeds.device}")
+            print(f"  Attention mask: {final_attention_mask.shape}, dtype: {final_attention_mask.dtype}, device: {final_attention_mask.device}")
+            if final_labels is not None:
+                print(f"  Labels: {final_labels.shape}")
+
+
+            print("\nReordering to original batch order...")
+            inverse_indices = torch.empty(len(original_indices_parts), dtype=torch.long, device=self.device)
+            inverse_indices[torch.tensor(original_indices_parts, device=self.device)] = torch.arange(len(original_indices_parts), device=self.device)
+
+            final_inputs_embeds = final_inputs_embeds[inverse_indices]
+            final_attention_mask = final_attention_mask[inverse_indices]
+            if final_labels is not None:
+                final_labels = final_labels[inverse_indices]
+
+            print("Final reordered shapes:")
+            print(f"  inputs_embeds: {final_inputs_embeds.shape}")
+            print(f"  attention_mask: {final_attention_mask.shape}")
+            if final_labels is not None:
+                print(f"  labels: {final_labels.shape}")
+
+            fwd_input_ids = None
+            fwd_inputs_embeds = final_inputs_embeds
+            fwd_attention_mask = final_attention_mask
+            fwd_labels = final_labels
+
+        else:
+            fwd_input_ids = input_ids
+            fwd_inputs_embeds = inputs_embeds
+            fwd_attention_mask = attention_mask
+            fwd_labels = labels
+
+        print("\nForwarding to parent class with shapes:")
+        print(f"  input_ids: {'None' if fwd_input_ids is None else fwd_input_ids.shape}")
+        print(f"  attention_mask: {fwd_attention_mask.shape}")
+        print(f"  inputs_embeds: {'None' if fwd_inputs_embeds is None else fwd_inputs_embeds.shape}")
+        print(f"  labels: {'None' if fwd_labels is None else fwd_labels.shape}")
+        print("=== End Forward Pass Debug ===")
+
+        return super().forward(
+            input_ids=fwd_input_ids,
+            attention_mask=fwd_attention_mask,
+            position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
+            inputs_embeds=fwd_inputs_embeds,
+            labels=fwd_labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        fwd_end = time.time()
-        print(f"[TIME] LlavaLlamaForCausalLM.forward duration: {fwd_end - fwd_start:.3f} sec")
-        return outputs
+
+
 
     def freeze_protein_related_modules(self):
         """Freezes protein encoder and optionally multimodal modules based on config."""
@@ -692,36 +925,18 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
             for name, param in self.protein_encoder.named_parameters():
                 param.requires_grad = False
             print("Protein encoder frozen.")
+
+            # set to eval mode
+            self.protein_encoder.eval()
+            print("Protein encoder set to eval mode.")
         
-        # Only freeze multimodal modules if not in tuning mode
-        if not self.protein_config.get("tune_mm_mlp_adapter", False):
-            print("[DEBUG] Freezing multimodal modules (tune_mm_mlp_adapter=False)")
-            if hasattr(self, 'mm_gated_cross_attention') and self.mm_gated_cross_attention is not None:
-                for name, param in self.mm_gated_cross_attention.named_parameters():
-                    param.requires_grad = False
-                print("GCA frozen.")
-            
-            if hasattr(self, 'mm_resampler') and self.mm_resampler is not None:
-                for name, param in self.mm_resampler.named_parameters():
-                    param.requires_grad = False
-                print("Resampler frozen.")
-            
-            if hasattr(self, 'mm_projector') and self.mm_projector is not None:
-                for name, param in self.mm_projector.named_parameters():
-                    param.requires_grad = False
-                print("Projector frozen.")
-        else:
-            print("[DEBUG] Keeping multimodal modules trainable (tune_mm_mlp_adapter=True)")
 
-        # Print trainable status
-        for name, param in self.named_parameters():
-            if any(module in name for module in ['mm_gated_cross_attention', 'mm_resampler', 'mm_projector', 'protein_encoder']):
-                print(f"[DEBUG] {name}: requires_grad = {param.requires_grad}")
 
-    def unfreeze_protein_related_modules(self):
-        """Unfreeze multimodal modules for fine-tuning."""
+    def unfreeze_pretrain_adapters(self):
+        """Unfreeze adapters modules."""
         # Only unfreeze if tuning is enabled
-        if hasattr(self, 'protein_config') and self.protein_config.get("tune_mm_mlp_adapter", False):
+        should_tune_adapter = getattr(self.config, "tune_mm_mlp_adapter", False)
+        if hasattr(self, 'protein_config') and should_tune_adapter:
             if hasattr(self, 'mm_gated_cross_attention') and self.mm_gated_cross_attention is not None:
                 for name, param in self.mm_gated_cross_attention.named_parameters():
                     param.requires_grad = True
@@ -745,48 +960,22 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM):
         else:
             print("[WARNING] tune_mm_mlp_adapter is False, keeping modules frozen. Set tune_mm_mlp_adapter=True to train these modules.")
 
-    def freeze_all_but_lora(self):
-        """Freezes base LLM and conditionally GCA/Resampler/Projector based on tune_mm_mlp_adapter flag"""
-        # Explicitly freeze LLM parameters that are not LoRA layers
-        for name, param in self.named_parameters():
-            # Skip adapter modules if they should be trained
-            if (self.protein_config.get("tune_mm_mlp_adapter", False) and 
-                any(module in name for module in ['mm_gated_cross_attention', 'mm_resampler', 'mm_projector'])):
-                continue
-                
-            # Freeze non-LoRA parameters
-            if not any(lora_str in name for lora_str in ['lora_', 'adapter']):
+
+    def freeze_pretrain_adapters(self):
+        """Freeze adapters modules."""
+
+        if hasattr(self, 'mm_gated_cross_attention') and self.mm_gated_cross_attention is not None:
+            for name, param in self.mm_gated_cross_attention.named_parameters():
                 param.requires_grad = False
-                print(f"[DEBUG] Freezing param: {name}")
-        print("Base LLM parameters frozen except for LoRA layers.")
-        
-        # Conditionally freeze GCA, Resampler, Projector based on tune_mm_mlp_adapter flag
-        if not self.protein_config.get("tune_mm_mlp_adapter", False):
-            if hasattr(self, 'mm_gated_cross_attention') and self.mm_gated_cross_attention is not None:
-                for name, param in self.mm_gated_cross_attention.named_parameters():
-                    param.requires_grad = False
-                print("GCA frozen for LoRA.")
-            if hasattr(self, 'mm_resampler') and self.mm_resampler is not None:
-                for name, param in self.mm_resampler.named_parameters():
-                    param.requires_grad = False
-                print("Resampler frozen for LoRA.")
-            if hasattr(self, 'mm_projector') and self.mm_projector is not None:
-                for name, param in self.mm_projector.named_parameters():
-                    param.requires_grad = False
-                print("Projector frozen for LoRA.")
-        else:
-            print("GCA, Resampler, and Projector will be trained alongside LoRA parameters (tune_mm_mlp_adapter=True)")
-        
-        # Verify proper freezing
-        trainable_params = [name for name, param in self.named_parameters() if param.requires_grad]
-        print(f"[DEBUG] Trainable parameters after freezing:")
-        for param in trainable_params:
-            print(f"  {param}")
-        
-        # Protein encoder should already be frozen from pretraining
-        if hasattr(self, 'protein_encoder') and self.protein_encoder is not None:
-             for param in self.protein_encoder.parameters():
+            print("GCA frozen.")
+        if hasattr(self, 'mm_resampler') and self.mm_resampler is not None:
+            for name, param in self.mm_resampler.named_parameters():
                 param.requires_grad = False
+            print("Resampler frozen.")
+        if hasattr(self, 'mm_projector') and self.mm_projector is not None:
+            for name, param in self.mm_projector.named_parameters():
+                param.requires_grad = False
+            print("Projector frozen.")
 
 class MLPProjector(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -822,20 +1011,22 @@ class MLPProjector(nn.Module):
         Returns: (batch_size, 1, num_media_tokens, output_dim)
         """
         orig_dtype = x.dtype
-        print(f"\n[DEBUG] MLPProjector forward: Input shape: {x.shape}, dtype: {x.dtype}")
+        # print(f"\n[DEBUG] MLPProjector forward: Input shape: {x.shape}, dtype: {x.dtype}")
         
         # Process through layers with proper dtype handling
         # Explicitly cast input to bfloat16 before linear layers
         x = self.linear1(x.to(torch.bfloat16))
-        print(f"[DEBUG] MLPProjector forward: After linear1 dtype: {x.dtype}")
+        # print(f"[DEBUG] MLPProjector forward: After linear1 dtype: {x.dtype}")
         
         x = self.act(x)  # GELU preserves dtype
-        print(f"[DEBUG] MLPProjector forward: After GELU dtype: {x.dtype}")
+        # print(f"[DEBUG] MLPProjector forward: After GELU dtype: {x.dtype}")
         
         x = self.linear2(x.to(torch.bfloat16))
-        print(f"[DEBUG] MLPProjector forward: After linear2 dtype: {x.dtype}")
+        # print(f"[DEBUG] MLPProjector forward: After linear2 dtype: {x.dtype}")
         
         # Return in original dtype
         out = x.to(orig_dtype)
-        print(f"[DEBUG] MLPProjector forward: Output dtype: {out.dtype}")
+        # print(f"[DEBUG] MLPProjector forward: Output dtype: {out.dtype}")
         return out
+
+

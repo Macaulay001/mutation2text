@@ -4,7 +4,7 @@ import yaml
 import json
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any
-
+import time
 import torch
 from transformers import (
     HfArgumentParser,
@@ -25,7 +25,7 @@ from llava.utils.model_utils import load_model_and_tokenizer
 class ModelArguments:
     model_name_or_path: str = field(default="meta-llama/Meta-Llama-3.1-8B-Instruct")
     protein_encoder_name_or_path: str = field(default="esm3_sm_open_v1") # Reverted to ESM3 model
-    mm_use_resampler_gca: bool = field(default=True)
+    mm_resampler: bool = field(default=True)
     mm_gated_cross_attention: bool = field(default=True)
     mm_projector_type: str = field(default="mlp2x_gelu")
     num_media_tokens: int = field(default=128)
@@ -49,6 +49,9 @@ class ModelArguments:
     ff_mult: int = field(default=4, metadata={"help": "Feed-forward multiplier for transformer layers."})
     perceiver_depth: int = field(default=6, metadata={"help": "Depth of the Perceiver architecture."})
     gca_output_dim: int = field(default=512, metadata={"help": "Output dimension for GCA (Gated Cross-Attention)."})
+    mm_gca_num_heads: int = field(default=8, metadata={"help": "Number of heads for GCA"})
+    mm_resampler_num_heads: int = field(default=8, metadata={"help": "Number of heads for resampler"})
+    resampler_output_dim: int = field(default=1536, metadata={"help": "Output dimension of the resampler"})
 
 @dataclass
 class DataArguments:
@@ -139,7 +142,7 @@ def main():
 
     print("Effective Model Arguments:", asdict(model_args))
     print("Effective Data Arguments:", asdict(data_args))
-    print("Effective Training Arguments (output_dir):", training_args.output_dir)
+    print("Effective Training Arguments:", asdict(training_args))
     if training_args.deepspeed:
         print("Effective Training Arguments (deepspeed config):", training_args.deepspeed)
 
@@ -181,28 +184,46 @@ def main():
 
     set_seed(training_args.seed)
 
+
+
+    #print the training args
+    print(f"[DEBUG] Training arguments: {training_args}")
+    print(f"[DEBUG] Model arguments: {model_args}")
+    print(f"[DEBUG] Data arguments: {data_args}")
+
+    print("[DEBUG] Loading model and tokenizer...")
     model, tokenizer = load_model_and_tokenizer(model_args, training_args)
 
+    t1 = time.time()
+    print("[DEBUG] Initializing training dataset.")
+    print(f"[DEBUG] Using data path: {data_args.data_path}")
+    print(f"[DEBUG] Tokenizer model: {model_args.model_name_or_path}")
+    print(f"[DEBUG] Max text length: {data_args.max_text_len}")
     train_dataset = MutationTextDataset(
         data_path=data_args.data_path,
         tokenizer=tokenizer,
-        max_text_len=data_args.max_text_len,
-        require_both_sequences=data_args.require_both_sequences
+        max_text_len=data_args.max_text_len
     )
+    print(f"[DEBUG] Training dataset initialized. Number of samples: {len(train_dataset)}")
+    print(f"[TIME] Dataset initialization took {time.time() - t1:.2f} seconds.")
 
     eval_dataset = None
     if training_args.do_eval:
+        t2 = time.time()
         if data_args.eval_data_path and os.path.exists(data_args.eval_data_path):
+            print("[DEBUG] Initializing evaluation dataset...")
             eval_dataset = MutationTextDataset(
                 data_path=data_args.eval_data_path,
                 tokenizer=tokenizer,
                 max_text_len=data_args.max_text_len,
-                require_both_sequences=data_args.require_both_sequences
             )
+            print(f"[DEBUG] Evaluation dataset initialized. Number of samples: {len(eval_dataset)}")
+            print(f"[TIME] Evaluation dataset initialization took {time.time() - t2:.2f} seconds.")
         else:
             print(f"Warning: `do_eval` is True, but `eval_data_path` ({data_args.eval_data_path}) is not provided or does not exist. No evaluation will be performed.")
             training_args.do_eval = False
 
+    t3 = time.time()
     trainer = AdapterTrainer(
         model=model,
         args=training_args,
@@ -211,23 +232,54 @@ def main():
         tokenizer=tokenizer,
         data_collator=custom_collate_fn,
     )
+    print("[DEBUG] AdapterTrainer initialized.")
+    print(f"[TIME] Trainer initialization took {time.time() - t3:.2f} seconds.")
+
+    print("\n=== DEBUG: Verifying Model State Before Training ===")
+    print("Trainable parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"  - {name}")
+    print("================================================\n")
 
     if training_args.do_train:
-        print("Starting LoRA finetuning...")
+        print("[DEBUG] Starting LoRA finetuning...")
+        print(f"[DEBUG] train_dataset length: {len(train_dataset) if train_dataset else 'None'}")
+        print(f"[DEBUG] training_args.num_train_epochs: {training_args.num_train_epochs}")
+        print(f"[DEBUG] training_args.per_device_train_batch_size: {training_args.per_device_train_batch_size}")
+        print(f"[DEBUG] training_args.gradient_accumulation_steps: {training_args.gradient_accumulation_steps}")
+        
+        t4 = time.time()
         train_result = trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
-        trainer.save_model() # Saves the full model, including LoRA weights if PEFT is used
-                           # For saving only LoRA adapter: model.save_pretrained(training_args.output_dir)
+        print(f"[TIME] trainer.train() took {time.time() - t4:.2f} seconds.")
+        print(f"[DEBUG] trainer.train() finished. Result: {train_result}")
+
+        t5 = time.time()
+        print("[DEBUG] Saving model...")
+        trainer.save_model()
+        print(f"[TIME] trainer.save_model() took {time.time() - t5:.2f} seconds.")
+
+        t6 = time.time()
+        print("[DEBUG] Logging and saving metrics...")
         trainer.log_metrics("train", train_result.metrics)
         trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
+        print(f"[TIME] Metrics logging and saving took {time.time() - t6:.2f} seconds.")
         print("LoRA finetuning finished. Model and state saved.")
 
     if training_args.do_eval and eval_dataset is not None:
-        print("Starting evaluation on the LoRA finetuned model...")
+        print("[DEBUG] Starting evaluation on the LoRA finetuned model...")
+        t7 = time.time()
         metrics = trainer.evaluate()
+        print(f"[TIME] trainer.evaluate() took {time.time() - t7:.2f} seconds.")
+        
+        t8 = time.time()
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+        print(f"[TIME] Evaluation metrics logging and saving took {time.time() - t8:.2f} seconds.")
         print("Evaluation finished. Metrics saved.")
+
+    # print(f"\n[TIME] Total script execution took {time.time() - start_total:.2f} seconds.")
 
 if __name__ == "__main__":
     main()
